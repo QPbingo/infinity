@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Monitor</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
+h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
+.subtitle { color: #8b949e; font-size: 0.8em; margin-bottom: 14px; }
+.status-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 8px 12px; background: #161b22; border-radius: 6px; font-size: 0.78em; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #f85149; }
+.status-dot.connected { background: #3fb950; }
+#token-section { background: #161b22; padding: 14px 16px; border-radius: 8px; margin-bottom: 14px; }
+#token-section label { display: block; margin-bottom: 4px; font-size: 0.82em; color: #8b949e; }
+#token-section input { width: 100%; padding: 7px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 0.88em; }
+#token-section button { margin-top: 6px; padding: 5px 14px; background: #238636; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82em; }
+.filters { display: flex; gap: 5px; margin-bottom: 10px; flex-wrap: wrap; }
+.filter-btn { padding: 3px 9px; border: 1px solid #30363d; background: #161b22; color: #8b949e; border-radius: 4px; cursor: pointer; font-size: 0.76em; }
+.filter-btn.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+.session-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+.card-header { display: flex; align-items: center; padding: 10px 14px; cursor: pointer; gap: 10px; }
+.card-header:hover { background: #1c2128; }
+.card-agent { font-weight: 600; font-size: 0.82em; color: #58a6ff; white-space: nowrap; }
+.card-title { font-size: 0.88em; color: #e6edf3; flex: 1; min-width: 0; line-height: 1.4; }
+.card-meta { display: flex; gap: 10px; font-size: 0.7em; color: #8b949e; align-items: center; white-space: nowrap; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 0.75em; font-weight: 500; }
+.badge-active { background: #238636; color: white; }
+.badge-idle { background: #9e6a03; color: white; }
+.badge-stopped { background: #484f58; color: white; }
+.badge-disappeared { background: #da3633; color: white; }
+.badge-unknown { background: #1f6feb; color: white; }
+.badge-event { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+.card-body { display: none; border-top: 1px solid #21262d; padding: 12px 14px 14px; background: #0d1117; }
+.card-body.open { display: block; }
+.block { margin-bottom: 10px; }
+.block-label { font-size: 0.68em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+.user-input { background: #1a2332; border-left: 3px solid #58a6ff; padding: 8px 12px; border-radius: 0 4px 4px 0; font-size: 0.82em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+.agent-output { background: #0b1a0b; border-left: 3px solid #3fb950; padding: 8px 12px; border-radius: 0 4px 4px 0; font-size: 0.78em; font-family: 'SF Mono', monospace; white-space: pre-wrap; word-break: break-word; line-height: 1.6; }
+.payload-section { background: #010409; border: 1px solid #21262d; border-radius: 4px; margin-top: 2px; }
+.payload-header { padding: 4px 10px; font-size: 0.68em; color: #8b949e; cursor: pointer; user-select: none; }
+.payload-body { display: none; padding: 6px 10px; }
+.payload-body.open { display: block; }
+.payload-body pre { margin: 0; font-size: 0.7em; color: #7d8590; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px 16px; font-size: 0.78em; }
+.info-item { display: flex; gap: 4px; }
+.info-key { color: #8b949e; }
+.info-val { color: #c9d1d9; font-family: 'SF Mono', monospace; font-size: 0.9em; }
+.empty-state { text-align: center; padding: 50px; color: #484f58; }
+</style>
+</head>
+<body>
+<h1>Agent Monitor</h1>
+<p class="subtitle">Local agent session tracking</p>
+
+<div id="token-section">
+  <label for="token-input">Daemon Token</label>
+  <input type="password" id="token-input" placeholder="Paste token from ~/.agent-monitor/local-token">
+  <button onclick="connect()">Connect</button>
+</div>
+
+<div class="status-bar">
+  <span class="status-dot" id="status-dot"></span>
+  <span id="status-text">Disconnected</span>
+  <span style="margin-left:auto" id="session-count"></span>
+</div>
+
+<div class="filters">
+  <button class="filter-btn active" data-filter="all">All</button>
+  <button class="filter-btn" data-filter="active">Active</button>
+  <button class="filter-btn" data-filter="idle">Idle</button>
+  <button class="filter-btn" data-filter="stopped">Stopped</button>
+  <button class="filter-btn" data-filter="disappeared">Disappeared</button>
+</div>
+
+<div id="cards-container"></div>
+
+<script>
+let ws = null;
+let sessions = {};
+let currentFilter = 'all';
+let expandedCards = {};
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter = btn.dataset.filter;
+    render();
+  });
+});
+
+const tokenInput = document.getElementById('token-input');
+const savedToken = localStorage.getItem('daemon_token');
+if (savedToken) tokenInput.value = savedToken;
+
+function connect() {
+  const token = tokenInput.value.trim();
+  if (!token) return;
+  localStorage.setItem('daemon_token', token);
+  document.getElementById('token-section').style.display = 'none';
+  if (ws) ws.close();
+  ws = new WebSocket('ws://localhost:9101/ws');
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
+  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onclose = () => { setStatus(false, 'Disconnected'); document.getElementById('token-section').style.display = 'block'; };
+  ws.onerror = () => setStatus(false, 'Connection error');
+}
+
+function setStatus(ok, text) {
+  document.getElementById('status-dot').classList.toggle('connected', ok);
+  document.getElementById('status-text').textContent = text;
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'auth_ok': setStatus(true, 'Connected'); break;
+    case 'auth_error': localStorage.removeItem('daemon_token'); setStatus(false, 'Auth failed'); document.getElementById('token-section').style.display = 'block'; ws.close(); return;
+    case 'snapshot': sessions = {}; msg.sessions.forEach(s => { sessions[s.session_key] = s; }); render(); break;
+    case 'session_added': sessions[msg.session.session_key] = msg.session; render(); break;
+    case 'delta': if (sessions[msg.session_key]) { Object.assign(sessions[msg.session_key], msg.changes); render(); } break;
+  }
+}
+
+function toggleCard(key) {
+  expandedCards[key] = !expandedCards[key];
+  const body = document.querySelector('[data-session="' + key + '"]');
+  if (body) body.classList.toggle('open', expandedCards[key]);
+}
+
+function togglePayload(key) {
+  const el = document.querySelector('[data-payload="' + key + '"]');
+  if (el) el.classList.toggle('open');
+}
+
+function render() {
+  let list = Object.values(sessions);
+  if (currentFilter !== 'all') list = list.filter(s => s.status === currentFilter);
+  list.sort((a, b) => b.last_event_time_ms - a.last_event_time_ms);
+  document.getElementById('session-count').textContent = list.length + ' sessions';
+
+  const container = document.getElementById('cards-container');
+  if (list.length === 0) {
+    container.innerHTML = '<div class="empty-state">No sessions — waiting for agent activity...</div>';
+    return;
+  }
+
+  container.innerHTML = list.map(s => {
+    const key = s.session_key;
+    const open = expandedCards[key] ? ' open' : '';
+    const terminal = s.terminal || '-';
+    const hasPayload = s.payload && s.payload !== 'null';
+
+    return '<div class="session-card">'
+      + '<div class="card-header" onclick="toggleCard(\'' + key + '\')">'
+      + '<span class="card-agent">' + esc(s.agent_type) + '</span>'
+      + '<span class="card-title">' + esc(s.session_title || s.agent_session_id) + '</span>'
+      + '<div class="card-meta">'
+      + '<span class="badge badge-' + s.status + '">' + s.status + '</span>'
+      + (s.last_hook_event ? '<span class="badge badge-event">' + esc(s.last_hook_event) + '</span>' : '')
+      + '<span>' + terminal + '</span>'
+      + '<span>CPU ' + (s.cpu_percent ? s.cpu_percent.toFixed(1)+'%' : '-') + '</span>'
+      + '<span>MEM ' + (s.memory_mb ? s.memory_mb.toFixed(0)+'MB' : '-') + '</span>'
+      + '<span>T' + (s.turn_count||0) + '</span>'
+      + '</div></div>'
+
+      + '<div class="card-body' + open + '" data-session="' + key + '">'
+
+      + (s.session_title ? '<div class="block"><div class="block-label">Title</div><div style="font-size:0.9em;color:#e6edf3;">' + esc(s.session_title) + '</div></div>' : '')
+
+      + '<div class="info-grid">'
+      + '<div class="info-item"><span class="info-key">PID</span><span class="info-val">' + (s.pid||'-') + '</span></div>'
+      + '<div class="info-item"><span class="info-key">Terminal</span><span class="info-val">' + esc(terminal) + '</span></div>'
+      + '<div class="info-item"><span class="info-key">CWD</span><span class="info-val">' + esc(s.cwd) + '</span></div>'
+      + '<div class="info-item"><span class="info-key">Turns</span><span class="info-val">' + (s.turn_count||0) + '</span></div>'
+      + '</div>'
+
+      + (s.user_input ? '<div class="block"><div class="block-label">User Prompt</div><div class="user-input">' + esc(s.user_input) + '</div></div>' : '<div class="block"><div class="block-label">User Prompt</div><div class="user-input" style="color:#484f58;font-style:italic">(waiting for user input event)</div></div>')
+
+      + (s.agent_output ? '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output">' + esc(s.agent_output) + '</div></div>' : '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output" style="color:#484f58;font-style:italic">(waiting for tool events — agent may not have run tools yet)</div></div>')
+
+      + (hasPayload ? '<div class="payload-section"><div class="payload-header" onclick="event.stopPropagation();togglePayload(\'' + key + '\')">▶ Raw Payload</div><div class="payload-body" data-payload="' + key + '"><pre>' + esc(formatPayload(s.payload)) + '</pre></div></div>' : '')
+
+      + '</div></div>';
+  }).join('');
+}
+
+function esc(s) { if (!s && s !== 0) return ''; return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function trunc(s, m) { if (!s) return '-'; return s.length > m ? s.slice(0,m) + '...' : s; }
+
+function formatPayload(p) {
+  if (!p || p === 'null') return '';
+  try { return JSON.stringify(typeof p === 'string' ? JSON.parse(p) : p, null, 2); }
+  catch (_) { return String(p); }
+}
+
+if (savedToken) connect();
+</script>
+</body>
+</html>
