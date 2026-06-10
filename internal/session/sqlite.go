@@ -8,6 +8,35 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// daemon_sessions table schema.
+//
+// The primary key is the natural composite of (user_id, device_id, agent_type, agent_session_id).
+// This means each unique agent session gets exactly one row, and any repeated hook events
+// for the same session will UPDATE the existing row via ON CONFLICT DO UPDATE.
+//
+// Column design:
+//   - Identity columns (user_id, device_id, agent_type, agent_session_id):
+//     Together form the primary key. Never change once a session is created.
+//
+//   - session_key: hex(SHA256(identity))[:16], used as the in-memory map key
+//     and for API lookups. Included for reverse lookup by key if needed.
+//
+//   - Process columns (pid, terminal, cwd, memory_mb, cpu_percent):
+//     Updated by PID Scanner via UpdateProcessFields(). These change frequently
+//     and are separated in a lighter UPDATE to avoid write contention.
+//
+//   - Status columns (status, start_time_ms, last_event_time_ms, ...):
+//     Updated by hook events via Upsert(). Status transitions follow the
+//     session lifecycle state machine.
+//
+//   - Content columns (user_input, agent_output, session_title, payload,
+//     last_hook_event, last_file, last_command, turn_count, git_branch):
+//     Extracted from hook event payloads, providing the dashboard with
+//     contextual information about what the agent is doing.
+//
+//   - Timestamp bookkeeping (created_at, updated_at, ended_at):
+//     created_at/updated_at are always set. ended_at is set when the session
+//     reaches a terminal state (stopped, disappeared).
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS daemon_sessions (
     user_id          TEXT NOT NULL,
@@ -40,6 +69,19 @@ CREATE TABLE IF NOT EXISTS daemon_sessions (
 );
 `
 
+// Light migration: adds content columns that may not exist in older databases.
+//
+// These were added after the initial table creation. ALTER TABLE ADD COLUMN
+// is safe in SQLite (no table locking issues for column additions).
+// The migration is designed to be idempotent – errors from duplicate columns
+// are silently ignored (db.Exec doesn't check the error).
+//
+// Columns added:
+//   - user_input:   the last user prompt text
+//   - agent_output: accumulated agent output log
+//   - session_title: first user input used as title
+//   - payload:      raw JSON of the most recent hook event
+//   - last_hook_event: raw event name from the hook
 const migrationSQL = `
 ALTER TABLE daemon_sessions ADD COLUMN user_input TEXT DEFAULT '';
 ALTER TABLE daemon_sessions ADD COLUMN agent_output TEXT DEFAULT '';
@@ -48,10 +90,34 @@ ALTER TABLE daemon_sessions ADD COLUMN payload TEXT DEFAULT '';
 ALTER TABLE daemon_sessions ADD COLUMN last_hook_event TEXT DEFAULT '';
 `
 
+// Store wraps a SQLite database connection for session persistence.
+//
+// Uses modernc.org/sqlite – a pure Go SQLite implementation with no CGO dependency.
+// This means the binary is fully static and cross-compilable without a C toolchain.
+//
+// Connection configuration:
+//   - _journal_mode=WAL: Write-Ahead Logging for better concurrent read performance.
+//     Writers don't block readers, readers don't block writers.
+//   - _busy_timeout=5000: Wait up to 5 seconds when encountering SQLITE_BUSY
+//     (another write is in progress), instead of failing immediately.
+//   - SetMaxOpenConns(1): Single writer. Multiple goroutines can read concurrently
+//     in WAL mode, but only one can write. This avoids SQLITE_BUSY entirely
+//     for our single-writer pattern.
 type Store struct {
 	db *sql.DB
 }
 
+// NewStore opens (or creates) the SQLite database and initializes the schema.
+//
+// Parameters:
+//   - dbPath: filesystem path to the SQLite database file (e.g. ~/.agent-monitor/daemon.db)
+//
+// Returns an error if:
+//   - The database cannot be opened
+//   - The CREATE TABLE fails (permissions, disk full, etc.)
+//
+// Migration errors (ALTER TABLE for columns that already exist) are silently ignored
+// because SQLite doesn't support IF NOT EXISTS for ALTER TABLE.
 func NewStore(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
@@ -65,22 +131,47 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create table: %w", err)
 	}
 
+	// Run migrations – errors are ignored because columns may already exist.
+	// This is a best-effort migration; a more robust approach would use a schema
+	// version table, but for the current simple column additions this suffices.
 	db.Exec(migrationSQL)
 
 	return &Store{db: db}, nil
 }
 
+// Close closes the database connection.
+//
+// Should be deferred in main() to ensure clean shutdown:
+//
+//	defer store.Close()
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Upsert inserts a new session or updates an existing one.
+//
+// Uses SQLite's INSERT ... ON CONFLICT DO UPDATE syntax for atomic upsert.
+// The conflict target is the composite primary key (user_id, device_id,
+// agent_type, agent_session_id).
+//
+// Behavior:
+//   - New row: INSERTs all columns including created_at, updated_at.
+//   - Existing row: UPDATEs all mutable columns, only sets updated_at.
+//   - ended_at: Set to current time if session status is stopped or disappeared
+//     (terminal states). nil otherwise (keeps previous value).
+//
+// This is used for full session state writes (hook events, status changes).
+// For process-metric-only updates, prefer UpdateProcessFields() which is lighter.
 func (s *Store) Upsert(sess *Session) error {
 	now := time.Now().UnixMilli()
+
+	// Only set ended_at for terminal states
 	endedAt := interface{}(nil)
 	if sess.Status == StatusStopped || sess.Status == StatusDisappeared {
 		endedAt = now
 	}
 
+	// "null" is a special JSON value that should be treated as empty
 	payload := string(sess.Payload)
 	if payload == "null" {
 		payload = ""
@@ -128,6 +219,21 @@ func (s *Store) Upsert(sess *Session) error {
 	return err
 }
 
+// UpdateProcessFields updates only process-level metrics in the database.
+//
+// This is a lighter UPDATE compared to Upsert() – it only changes:
+//   pid, terminal, cwd, memory_mb, cpu_percent, updated_at
+//
+// It does NOT touch: status, hook event data, content fields, ended_at.
+//
+// This reduces write contention because:
+//   1. Fewer columns updated → smaller WAL entries.
+//   2. Hook events (Upsert) and process scans (UpdateProcessFields) touch
+//      different columns, reducing SQLite page-level conflicts.
+//   3. updated_at timestamp is still refreshed to show liveness.
+//
+// Called by HandlePidUpdate() on every PID scan cycle where process
+// metrics changed meaningfully.
 func (s *Store) UpdateProcessFields(sess *Session) error {
 	now := time.Now().UnixMilli()
 	_, err := s.db.Exec(`
@@ -143,6 +249,20 @@ func (s *Store) UpdateProcessFields(sess *Session) error {
 	return err
 }
 
+// LoadAll loads all sessions from the database into memory.
+//
+// Called once at daemon startup to restore state from the previous run.
+// Sessions are ordered by start_time_ms DESC (most recent first).
+//
+// Field mapping note:
+//   - Separate variables are used for TEXT columns that could be NULL (user_input,
+//     agent_output, session_title, payload, last_hook_event) to handle the
+//     transition from empty string to non-NULL.
+//   - created_at and updated_at are scanned but discarded (not needed in memory).
+//
+// The session's lastHookTime is initialized from LastEventTimeMs. This is
+// acceptable because the PID Scanner will run immediately after recovery
+// and detect any idle/dead sessions.
 func (s *Store) LoadAll() ([]*Session, error) {
 	rows, err := s.db.Query(`
 		SELECT user_id, device_id, agent_type, agent_session_id, session_key,
@@ -169,7 +289,7 @@ func (s *Store) LoadAll() ([]*Session, error) {
 			&s.LastEventTimeMs, &s.LastEventType, &s.LastFile, &s.LastCommand,
 			&userInput, &agentOutput, &sessionTitle, &payload, &lastHookEvent,
 			&s.MemoryMB, &s.CPUPercent, &s.TurnCount, &s.GitBranch,
-			new(int64), new(int64),
+			new(int64), new(int64), // created_at, updated_at – discard
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}

@@ -9,18 +9,44 @@ import (
 	"github.com/heybox/agent-monitor/internal/scanner"
 )
 
+// NotifyFunc is a callback that SessionManager calls when sessions change.
+// Injected via SetNotify(), typically wired to WebSocket Hub for real-time
+// dashboard updates.
+//
+// Parameters:
+//   - eventType: "delta" (incremental change) or "session_added" (new session)
+//   - data:      *Delta for "delta", *Session for "session_added"
 type NotifyFunc func(eventType string, data interface{})
 
+// SessionManager is the central state store for all agent sessions.
+//
+// It maintains an in-memory map of sessions keyed by SessionKey, protected
+// by a sync.RWMutex for concurrent access from:
+//   - EventWatcher goroutine (HandleEvent – hook events from agents)
+//   - PID Scanner goroutine (HandlePidUpdate, MarkDisappeared, CheckIdleSessions)
+//   - HTTP handlers (GetSessions, GetSession – REST API reads)
+//   - WebSocket Hub (GetSnapshot – full state for new clients)
+//
+// All write operations also persist to SQLite to survive daemon restarts.
+// Process-field-only updates use a lighter UpdateProcessFields() to avoid
+// contention with hook event writes.
+//
+// The notification callback (SetNotify) bridges SessionManager to the WebSocket
+// Hub without creating a circular dependency.
 type SessionManager struct {
 	mu       sync.RWMutex
-	sessions map[string]*Session
-	store    *Store
-	notify   NotifyFunc
+	sessions map[string]*Session // map[SessionKey]*Session, the in-memory store
+	store    *Store              // SQLite persistence layer (nil if not available)
+	notify   NotifyFunc          // Callback for real-time updates (wired to WebSocket Hub)
 
-	userID   string
-	deviceID string
+	userID   string // User identifier (--user-id flag)
+	deviceID string // Device identifier (UUID v4 from device-id file)
 }
 
+// NewSessionManager creates a new session manager with the given store and identity.
+//
+// After creation, call LoadFromStore() to restore persisted sessions,
+// then call SetNotify() to wire up the notification callback.
 func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	return &SessionManager{
 		sessions: make(map[string]*Session),
@@ -30,10 +56,27 @@ func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	}
 }
 
+// SetNotify registers a callback that fires on every session change.
+//
+// Called once during startup in main.go:
+//
+//	mgr.SetNotify(func(eventType string, data interface{}) {
+//	    srv.GetHub().Notify(eventType, data)
+//	})
+//
+// This decouples SessionManager from the WebSocket layer – SessionManager
+// doesn't need to know how real-time updates are delivered.
 func (sm *SessionManager) SetNotify(fn NotifyFunc) {
 	sm.notify = fn
 }
 
+// LoadFromStore restores all sessions from SQLite into the in-memory map.
+//
+// Called once at startup after SQLite initialization.
+// Skips duplicate sessions (same SessionKey) that already exist in memory.
+// This is a full restore – all fields including process metrics and hook data
+// are loaded. Sessions that were "active" or "idle" in the last run will be
+// restored with those statuses; the PID Scanner will verify or update them.
 func (sm *SessionManager) LoadFromStore() {
 	sessions, err := sm.store.LoadAll()
 	if err != nil {
@@ -50,10 +93,44 @@ func (sm *SessionManager) LoadFromStore() {
 	log.Printf("[session] loaded %d sessions from store", len(sessions))
 }
 
+// HandleEvent processes a hook event from the EventWatcher.
+//
+// This is the primary data ingestion method. It is called synchronously from
+// the EventWatcher's goroutine for each valid event line in events.jsonl.
+//
+// Processing flow:
+//
+//	1. Map raw event name to standardized EventType (via HookToEventType).
+//	   If the event name is not in the map, use the raw name as the type.
+//
+//	2. Compute SessionKey and look up (or create) the session in the in-memory map.
+//
+//	3. For a new session:
+//	   a. Reject "Stop"/"session_end" events – a session_end without a prior
+//	      session_start is a stale event, ignore it.
+//	   b. Create a new Session with Status=active, set StartTimeMs to event time.
+//	   c. Apply the event's data (user input, tool info, etc.) via applyEvent().
+//	   d. Upsert to SQLite.
+//	   e. Notify "session_added" to WebSocket clients.
+//
+//	4. For an existing session:
+//	   a. Save a copy of the old state (old := *sess).
+//	   b. Handle specific event types:
+//	      - session_start: Reset status to Active, update CWD/PID/lastHookTime.
+//	                        This handles session restart within the same agent process.
+//	      - session_end:   Set Status to Stopped, extract model output from payload.
+//	                        Stopped is terminal – only session_start can restart it.
+//	      - default:       Apply event via applyEvent() (updates turns, tools, output).
+//	   c. Upsert to SQLite.
+//	   d. Compute delta (diff old vs. new) and notify "delta" if anything changed.
+//
+// Thread safety: Holds write lock for the entire duration to prevent races
+// with PID Scanner operations.
 func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// Normalize agent-specific event names to standardized EventType
 	eventType, ok := HookToEventType[event.Event]
 	if !ok {
 		eventType = EventType(event.Event)
@@ -62,11 +139,14 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	key := ComputeSessionKey(sm.userID, sm.deviceID, event.AgentType, event.SessionID)
 	sess, exists := sm.sessions[key]
 
+	// ── Case 1: New session (first time seeing this key) ────────────────
 	if !exists {
+		// Reject stale session_end events for unknown sessions
 		if event.Event == "Stop" || event.Event == "session_end" {
 			return
 		}
 
+		// Create brand-new session with initial state
 		sess = &Session{
 			UserID:         sm.userID,
 			DeviceID:       sm.deviceID,
@@ -79,14 +159,19 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		}
 		sm.sessions[key] = sess
 
+		// Apply event data: extracts user input, tool info, model output
+		// based on the event type (user_prompt, tool_use, notification).
 		sess.applyEvent(event, eventType)
 
+		// Persist to SQLite so this session survives daemon restart
 		if sm.store != nil {
 			if err := sm.store.Upsert(sess); err != nil {
 				log.Printf("[session] upsert new session: %v", err)
 			}
 		}
 
+		// Notify dashboard that a new session appeared
+		// Payload is stripped from the clone for privacy/bandwidth
 		if sm.notify != nil {
 			clone := *sess
 			clone.Payload = nil
@@ -95,10 +180,14 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		return
 	}
 
-	old := *sess
+	// ── Case 2: Existing session – update state based on event type ─────
+	old := *sess // snapshot before mutation for delta computation
 
 	switch string(eventType) {
 	case "session_start":
+		// Agent explicitly started/re-started – reset to active
+		// This can happen when: user re-opens a conversation, or a stopped
+		// session gets restarted in the same agent instance.
 		sess.Status = StatusActive
 		sess.StartTimeMs = event.TimestampMs
 		sess.LastEventTimeMs = event.TimestampMs
@@ -110,6 +199,8 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		sess.Payload = event.Payload
 
 	case "session_end":
+		// Agent conversation ended – move to terminal stopped state
+		// Extract the final model output for display in the dashboard
 		sess.Status = StatusStopped
 		sess.LastEventTimeMs = event.TimestampMs
 		sess.LastEventType = string(eventType)
@@ -118,15 +209,21 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		sess.extractModelOutput(event.Payload)
 
 	default:
+		// All other events: user_prompt, pre_tool_use, post_tool_use, notification
+		// applyEvent() handles: updating timestamps, incrementing turn count,
+		// extracting user input, tool info, model output, and setting Status to Active
 		sess.applyEvent(event, eventType)
 	}
 
+	// Persist the updated session state to SQLite
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] upsert session: %v", err)
 		}
 	}
 
+	// Compute what changed and notify dashboards via WebSocket
+	// computeDelta() returns nil if nothing changed (same field values)
 	if sm.notify != nil {
 		delta := sm.computeDelta(&old, sess)
 		if delta != nil {
@@ -135,38 +232,78 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	}
 }
 
+// applyEvent updates a Session's fields based on a hook event.
+//
+// Always updates: LastEventTimeMs, LastEventType, LastHookEvent, CWD, PID,
+// lastHookTime, Payload, and sets Status to Active.
+//
+// Type-specific updates:
+//
+//	user_prompt:
+//	  - Increments TurnCount
+//	  - Extracts user input text from payload (searches for keys: prompt,
+//	    user_input, text, message)
+//	  - If SessionTitle is empty, sets it to the first user input
+//
+//	pre_tool_use / post_tool_use:
+//	  - Extracts tool name and file path from payload
+//	  - Extracts tool input (command, filePath) from payload
+//	  - Appends a formatted line to AgentOutput: "[HH:MM:SS] <event> <tool> → <output>"
+//
+//	notification:
+//	  - Extracts model output text from payload (searches for keys:
+//	    last_assistant_message, model_output, output, text, response)
+//	  - Appends to AgentOutput: "[model] <text>"
 func (s *Session) applyEvent(event *HookEvent, eventType EventType) {
+	// ── Always-updated fields ──────────────────────────────────────────
 	s.LastEventTimeMs = event.TimestampMs
 	s.LastEventType = string(eventType)
 	s.LastHookEvent = event.Event
 	s.CWD = event.CWD
 	s.PID = event.PID
-	s.lastHookTime = event.TimestampMs
+	s.lastHookTime = event.TimestampMs // for idle detection
 	s.Payload = event.Payload
 
+	// ── Type-specific field extraction ─────────────────────────────────
 	switch eventType {
 	case EventUserPrompt:
+		// Increment interaction count
 		s.TurnCount++
+		// Capture user input for display
 		s.extractUserInput(event.Payload)
+		// Use first user input as session title
 		if s.SessionTitle == "" && s.UserInput != "" {
 			s.SessionTitle = s.UserInput
 		}
 
 	case EventPostToolUse:
+		// Extract tool name + file path, append to agent output log
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
 
 	case EventPreToolUse:
+		// Extract tool name + file path, append to agent output log
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
 
 	case EventNotification:
+		// Extract model response text, append to agent output log
 		s.extractModelOutput(event.Payload)
 	}
 
+	// Any hook event means the agent is active and producing output
 	s.Status = StatusActive
 }
 
+// extractUserInput extracts user prompt text from the event payload.
+//
+// Searches for common key names used across different agents:
+//   - "prompt" (opencode)
+//   - "user_input" (claude code)
+//   - "text" (generic)
+//   - "message" (generic)
+//
+// The first non-empty string value found is stored in s.UserInput.
 func (s *Session) extractUserInput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -183,6 +320,25 @@ func (s *Session) extractUserInput(payload json.RawMessage) {
 	}
 }
 
+// appendAgentOutput extracts tool invocation info from the event payload
+// and appends a formatted log line to AgentOutput.
+//
+// Format: "[HH:MM:SS] <hook_event> <tool_name> → <tool_output/command/file>"
+//
+// Examples:
+//
+//	"[14:25:03] PreToolUse Bash → ls -la"
+//	"[14:25:05] PostToolUse Read → /path/to/file.go"
+//	"[14:26:01] PreToolUse Write → main.go"
+//
+// The tool name is extracted from "tool_name" or "tool" keys.
+// The tool output/command is extracted from:
+//   - "tool_output" or "output" keys (direct output)
+//   - "tool_input.command" (shell commands from bash tool)
+//   - "tool_input.filePath"/"file_path"/"path" (file operations)
+//   - If only tool_input with no recognizable keys, shows first key name
+//
+// AgentOutput accumulates across events, separated by newlines.
 func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -192,15 +348,18 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 		return
 	}
 
+	// Extract tool name from "tool_name" or "tool" keys
 	toolName, _ := data["tool_name"].(string)
 	if toolName == "" {
 		toolName, _ = data["tool"].(string)
 	}
 
+	// Extract tool output from various possible locations
 	output, _ := data["tool_output"].(string)
 	if output == "" {
 		output, _ = data["output"].(string)
 	}
+	// If no direct output, try to extract from tool_input sub-object
 	if output == "" {
 		if toolInput, ok := data["tool_input"].(map[string]interface{}); ok {
 			if cmd, ok := toolInput["command"].(string); ok {
@@ -212,6 +371,7 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 			} else if fp, ok := toolInput["path"].(string); ok {
 				output = fp
 			} else {
+				// Unknown tool input structure – show the first key name
 				keys := make([]string, 0, len(toolInput))
 				for k := range toolInput {
 					keys = append(keys, k)
@@ -223,6 +383,7 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 		}
 	}
 
+	// Build the log line: tool name or output is required
 	line := ""
 	if toolName != "" {
 		line = "[" + toolName + "]"
@@ -236,6 +397,8 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	if line == "" {
 		return
 	}
+
+	// Format: "[HH:MM:SS] <event_type> <tool_name> → <output>"
 	ts := time.Now().Format("15:04:05")
 	if s.AgentOutput != "" {
 		s.AgentOutput += "\n"
@@ -252,6 +415,16 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	}
 }
 
+// extractModelOutput extracts the model's textual response from the payload.
+//
+// Searches for common key names across agents:
+//   - "last_assistant_message" (opencode)
+//   - "model_output" (claude code)
+//   - "output" (generic)
+//   - "text" (generic)
+//   - "response" (generic)
+//
+// Appends to AgentOutput as: "[model] <model response text>"
 func (s *Session) extractModelOutput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -271,6 +444,16 @@ func (s *Session) extractModelOutput(payload json.RawMessage) {
 	}
 }
 
+// extractToolInfo extracts the tool name and file path from an event payload.
+//
+// Separates tool identification into:
+//   - LastCommand: the tool/command name (e.g. "Bash", "Read", "Edit")
+//     Sources: "tool", "tool_name", "command"
+//   - LastFile: the file path being operated on (e.g. "/path/to/file.go")
+//     Sources: payload direct "filePath"/"file"/"file" keys,
+//              or nested "input.filePath"/"input.file_path"/"input.path"
+//
+// This provides the dashboard with quick context on what the agent is doing.
 func (s *Session) extractToolInfo(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -279,6 +462,8 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
+
+	// Extract tool/command name
 	if tool, ok := data["tool"].(string); ok {
 		s.LastCommand = tool
 	} else if tool, ok := data["tool_name"].(string); ok {
@@ -286,6 +471,8 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	} else if tool, ok := data["command"].(string); ok {
 		s.LastCommand = tool
 	}
+
+	// Extract file path from input sub-object
 	if input, ok := data["input"].(map[string]interface{}); ok {
 		if fp, ok := input["filePath"].(string); ok {
 			s.LastFile = fp
@@ -295,6 +482,8 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 			s.LastFile = fp
 		}
 	}
+
+	// Extract file path from top-level payload (higher priority)
 	if file, ok := data["filePath"].(string); ok {
 		s.LastFile = file
 	} else if file, ok := data["file"].(string); ok {
@@ -303,7 +492,22 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 }
 
 // HandlePidUpdate is called by PID Scanner when an agent process is found alive.
-// Updates CPU/Memory/CWD/Terminal, resurrects disappeared sessions.
+//
+// This is the primary way process-level metrics flow into the session manager.
+// Only updates fields that changed meaningfully to avoid unnecessary notifications
+// and database writes.
+//
+// Update thresholds (avoid noisy updates for floating values):
+//   - CPU:     change must exceed 0.1 percentage points
+//   - Memory:  change must exceed 0.5 MB
+//
+// Special behavior:
+//   - If session status is Disappeared, resurrects it to Active.
+//     This handles the case where a process briefly vanished from the process
+//     table (e.g., during fork/exec) but is actually still running.
+//
+// Uses the lighter UpdateProcessFields() SQLite method (only writes process
+// fields, not full session data) to reduce write contention with hook events.
 func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -314,31 +518,44 @@ func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo)
 	}
 
 	changed := false
+
+	// Update PID if it changed (e.g., agent restarted with new PID but same CWD)
 	if sess.PID != int(info.PID) {
 		sess.PID = int(info.PID)
 		changed = true
 	}
+
+	// Update CWD if the process moved directories (unusual but possible via os.Chdir)
 	if sess.CWD != info.CWD && info.CWD != "" {
 		sess.CWD = info.CWD
 		changed = true
 	}
+
+	// Update CPU percentage only if change exceeds noise threshold (0.15%)
 	if diff := abs(sess.CPUPercent - info.CPUPercent); diff > 0.1 {
 		sess.CPUPercent = info.CPUPercent
 		changed = true
 	}
+
+	// Update memory only if change exceeds noise threshold (0.5MB)
 	if diff := abs(sess.MemoryMB - info.MemoryMB); diff > 0.5 {
 		sess.MemoryMB = info.MemoryMB
 		changed = true
 	}
+
+	// Always store process creation time (set once, doesn't change)
 	if info.CreateTimeMs > 0 {
 		sess.ProcessCreateTimeMs = info.CreateTimeMs
 	}
 
+	// Update terminal emulator name if it changed
 	if info.Name != "" && sess.Terminal != info.Name {
 		sess.Terminal = info.Name
 		changed = true
 	}
 
+	// Resurrection: if process was marked disappeared but we found it again,
+	// revive it to active status and refresh the hook timer
 	if sess.Status == StatusDisappeared {
 		sess.Status = StatusActive
 		sess.lastHookTime = time.Now().UnixMilli()
@@ -349,12 +566,16 @@ func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo)
 		return
 	}
 
+	// Lighter persistence: only update process-related fields
+	// Uses a targeted UPDATE rather than full ON CONFLICT UPSERT
 	if sm.store != nil {
 		if err := sm.store.UpdateProcessFields(sess); err != nil {
 			log.Printf("[session] update process fields: %v", err)
 		}
 	}
 
+	// Notify WebSocket clients of process-level changes
+	// Uses a simplified changes map (only process fields that dashboard needs)
 	if sm.notify != nil {
 		changes := map[string]interface{}{
 			"pid":        sess.PID,
@@ -374,6 +595,16 @@ func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo)
 	}
 }
 
+// MarkDisappeared is called by PID Scanner when a known agent process
+// is no longer found in the OS process table.
+//
+// Only marks sessions that are not already in a terminal state:
+//   - Stopped:     already ended via hook event, skip (terminal state)
+//   - Disappeared: already marked, skip (idempotent)
+//   - Active/Idle: transition to Disappeared
+//
+// A disappeared session can be resurrected if the process reappears
+// in a subsequent PID scan (HandlePidUpdate will detect it and revive).
 func (sm *SessionManager) MarkDisappeared(key string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -383,18 +614,21 @@ func (sm *SessionManager) MarkDisappeared(key string) {
 		return
 	}
 
+	// Don't re-mark sessions already in terminal states
 	if sess.Status == StatusStopped || sess.Status == StatusDisappeared {
 		return
 	}
 
 	sess.Status = StatusDisappeared
 
+	// Persist the status change
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] mark disappeared: %v", err)
 		}
 	}
 
+	// Notify dashboard of the status change
 	if sm.notify != nil {
 		changes := map[string]interface{}{"status": string(StatusDisappeared)}
 		delta := &Delta{
@@ -406,12 +640,24 @@ func (sm *SessionManager) MarkDisappeared(key string) {
 	}
 }
 
+// CheckIdleSessions marks active sessions as idle if no hook events have
+// been received for more than 5 minutes.
+//
+// Called by PID Scanner at the end of each scan cycle.
+// Only considers sessions with Status=Active or Status=Idle.
+// Sessions with zero lastHookTime (never received a hook event) are skipped.
+//
+// An idle session becomes active again as soon as any hook event arrives
+// (applyEvent sets Status=Active on every event).
+//
+// Note: idle marking does NOT persist to SQLite – it's a transient display
+// state that doesn't need crash recovery.
 func (sm *SessionManager) CheckIdleSessions() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	now := time.Now().UnixMilli()
-	idleThreshold := int64(5 * 60 * 1000)
+	idleThreshold := int64(5 * 60 * 1000) // 5 minutes in milliseconds
 
 	for key, sess := range sm.sessions {
 		if sess.Status != StatusActive && sess.Status != StatusIdle {
@@ -437,6 +683,11 @@ func (sm *SessionManager) CheckIdleSessions() {
 	}
 }
 
+// GetSessions returns a copy of all sessions for the REST API.
+//
+// Each session is shallow-copied (the struct is copied, but Payload
+// is raw JSON which is safe for concurrent reads).
+// Returns an empty slice (not nil) if no sessions exist.
 func (sm *SessionManager) GetSessions() []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -449,6 +700,10 @@ func (sm *SessionManager) GetSessions() []*Session {
 	return result
 }
 
+// GetSession returns a copy of a single session by its SessionKey.
+//
+// Returns nil if the session is not found.
+// The session is shallow-copied for thread safety.
 func (sm *SessionManager) GetSession(key string) *Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -461,6 +716,18 @@ func (sm *SessionManager) GetSession(key string) *Session {
 	return &clone
 }
 
+// GetKnownPIDs returns all session→PID mappings for the PID Scanner.
+//
+// Called at the beginning of each PID scan cycle. The scanner uses this
+// to match discovered OS processes to their corresponding sessions.
+//
+// Returns a map of PID → SessionPIDInfo containing:
+//   - SessionKey: for session lookup during HandlePidUpdate/MarkDisappeared
+//   - PID:        the process ID to match against
+//   - AgentType:  for fallback matching when PID doesn't match directly
+//   - CWD:        for fallback matching when PID doesn't match directly
+//
+// Only sessions with PID > 0 (i.e., have been matched to a process) are included.
 func (sm *SessionManager) GetKnownPIDs() map[int]scanner.SessionPIDInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -478,6 +745,14 @@ func (sm *SessionManager) GetKnownPIDs() map[int]scanner.SessionPIDInfo {
 	return result
 }
 
+// GetSnapshot returns a full copy of all sessions for new WebSocket clients.
+//
+// Called when a WebSocket client successfully authenticates. The snapshot
+// gives the client a complete initial state, after which only incremental
+// Delta messages are sent.
+//
+// Payload fields are stripped from each session copy – the raw hook payload
+// can be large and is not needed for dashboard display.
 func (sm *SessionManager) GetSnapshot() *Snapshot {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -485,7 +760,7 @@ func (sm *SessionManager) GetSnapshot() *Snapshot {
 	sessions := make([]*Session, 0, len(sm.sessions))
 	for _, s := range sm.sessions {
 		clone := *s
-		clone.Payload = nil
+		clone.Payload = nil // strip raw payload for bandwidth/privacy
 		sessions = append(sessions, &clone)
 	}
 
@@ -495,6 +770,11 @@ func (sm *SessionManager) GetSnapshot() *Snapshot {
 	}
 }
 
+// GetSessionsForRecovery returns the internal session map for use during
+// session recovery at startup.
+//
+// Recovery uses this to check for existing sessions before creating
+// recovered ones, avoiding duplicates.
 func (sm *SessionManager) GetSessionsForRecovery() map[string]*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -506,6 +786,9 @@ func (sm *SessionManager) GetSessionsForRecovery() map[string]*Session {
 	return result
 }
 
+// HasSession checks whether a session with the given key exists.
+//
+// Used by Recovery to skip transcript sessions that are already tracked.
 func (sm *SessionManager) HasSession(key string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -513,6 +796,11 @@ func (sm *SessionManager) HasSession(key string) bool {
 	return ok
 }
 
+// AddRecoveredSession adds a session recovered from transcript files.
+//
+// Only adds if the session doesn't already exist (idempotent).
+// Recovered sessions typically have Status=unknown until the PID Scanner
+// matches them to a running process via BindPIDToSession().
 func (sm *SessionManager) AddRecoveredSession(sess *Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -531,6 +819,16 @@ func (sm *SessionManager) AddRecoveredSession(sess *Session) {
 	}
 }
 
+// BindPIDToSession binds a recovered session to a running OS process.
+//
+// Called during recovery after FindProcessBySession() successfully matches
+// a transcript session to a currently running agent process.
+//
+// Updates all process-level fields (PID, Terminal, CWD, CPU%, Memory) and
+// promotes the session status from Unknown to Active.
+//
+// Sets lastHookTime to current time so the session won't immediately be
+// marked idle after recovery.
 func (sm *SessionManager) BindPIDToSession(key string, info *scanner.ProcessInfo) {
 
 	sm.mu.Lock()
@@ -557,8 +855,19 @@ func (sm *SessionManager) BindPIDToSession(key string, info *scanner.ProcessInfo
 	}
 }
 
-// computeDelta compares old and new session state, returning only changed fields.
-// Returns nil if nothing changed.
+// computeDelta compares an old and new Session state, returning only the
+// fields that changed.
+//
+// This enables efficient WebSocket updates: instead of sending the full
+// session object on every change, only the modified fields are sent.
+// The dashboard client applies these changes incrementally to its local state.
+//
+// Returns nil if no fields changed (no notification is sent in that case).
+//
+// Comparison logic:
+//   - Compares old vs. new for each mutable field
+//   - Adds changed field to the changes map with its new value
+//   - JSON field names are used as map keys (matching the Session struct tags)
 func (sm *SessionManager) computeDelta(old, new *Session) *Delta {
 	changes := make(map[string]interface{})
 	if old.PID != new.PID {
