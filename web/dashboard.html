@@ -20,11 +20,11 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .filter-btn { padding: 3px 9px; border: 1px solid #30363d; background: #161b22; color: #8b949e; border-radius: 4px; cursor: pointer; font-size: 0.76em; }
 .filter-btn.active { background: #1f6feb; border-color: #1f6feb; color: white; }
 .session-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
-.card-header { display: flex; align-items: center; padding: 10px 14px; cursor: pointer; gap: 10px; }
+.card-header { display: flex; align-items: center; padding: 8px 12px; cursor: pointer; gap: 8px; height: 36px; overflow: hidden; }
 .card-header:hover { background: #1c2128; }
-.card-agent { font-weight: 600; font-size: 0.82em; color: #58a6ff; white-space: nowrap; }
-.card-title { font-size: 0.88em; color: #e6edf3; flex: 1; min-width: 0; line-height: 1.4; }
-.card-meta { display: flex; gap: 10px; font-size: 0.7em; color: #8b949e; align-items: center; white-space: nowrap; }
+.card-agent { font-weight: 600; font-size: 0.78em; color: #58a6ff; white-space: nowrap; flex-shrink: 0; }
+.card-title { font-size: 0.82em; color: #e6edf3; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-meta { display: flex; gap: 6px; font-size: 0.68em; color: #8b949e; align-items: center; white-space: nowrap; flex-shrink: 0; }
 .badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 0.75em; font-weight: 500; }
 .badge-active { background: #238636; color: white; }
 .badge-idle { background: #9e6a03; color: white; }
@@ -64,11 +64,15 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .tl-user-text { font-size: 0.82em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #e6edf3; background: #1a2332; padding: 8px 12px; border-radius: 4px; margin-top: 2px; }
 .tl-tool-group-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
 .tl-tool-group-header:hover { opacity: 0.85; }
+.tl-collapse-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 2px 0; }
+.tl-collapse-header:hover { opacity: 0.85; }
 .tl-arrow { font-size: 0.6em; transition: transform 0.15s; display: inline-block; }
 .tl-arrow.open { transform: rotate(90deg); }
 .tl-tool-count { font-size: 0.68em; color: #8b949e; }
 .tl-tools { display: none; margin-top: 6px; }
 .tl-tools.open { display: block; }
+.tl-result-body { display: none; margin-top: 4px; }
+.tl-result-body.open { display: block; }
 .tl-tool { background: #010409; border: 1px solid #21262d; border-radius: 4px; padding: 6px 10px; margin-bottom: 4px; }
 .tl-tool:last-child { margin-bottom: 0; }
 .tl-tool-head { display: flex; align-items: center; gap: 8px; font-size: 0.72em; }
@@ -121,6 +125,7 @@ let sessions = {};
 let currentFilter = 'all';
 let expandedCards = {};
 let expandedToolGroups = {};
+let expandedResults = {};
 
 document.querySelectorAll('.filter-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -178,6 +183,15 @@ function toggleToolGroup(key, turnIdx, groupIdx) {
   if (arrow) arrow.classList.toggle('open', expandedToolGroups[id]);
 }
 
+function toggleResult(key, turnIdx, entryIdx) {
+  const id = key + '_' + turnIdx + '_' + entryIdx;
+  expandedResults[id] = !expandedResults[id];
+  const el = document.querySelector('[data-res="' + id + '"]');
+  if (el) el.classList.toggle('open', expandedResults[id]);
+  const arrow = document.querySelector('[data-arrow="' + id + '"]');
+  if (arrow) arrow.classList.toggle('open', expandedResults[id]);
+}
+
 function togglePayload(key) {
   const el = document.querySelector('[data-payload="' + key + '"]');
   if (el) el.classList.toggle('open');
@@ -217,9 +231,21 @@ function renderTimeline(turns, key) {
         html += '<div class="tl-text">' + esc(entry.text) + '</div>';
         html += '</div>';
       } else if (entry.type === 'A_result') {
+        const resId = key + '_' + ti + '_' + ei;
+        const isOpen = expandedResults[resId];
+        const text = entry.text || '';
+        const long = text.length > 200 || text.split('\n').length > 3;
         html += '<div class="tl-entry">';
         html += '<div class="tl-entry-header"><span class="tl-badge-a">A</span><span class="tl-label">Result</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
-        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        if (long) {
+          html += '<div class="tl-collapse-header" onclick="event.stopPropagation();toggleResult(\'' + key + '\',' + ti + ',' + ei + ')">';
+          html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + resId + '">▶</span>';
+          html += '<span style="font-size:0.7em;color:#8b949e">' + esc(text.split('\n')[0].substring(0, 80)) + (text.length > 80 || text.includes('\n') ? '...' : '') + '</span>';
+          html += '</div>';
+          html += '<div class="tl-result-body' + (isOpen ? ' open' : '') + '" data-res="' + resId + '"><div class="tl-text">' + esc(text) + '</div></div>';
+        } else {
+          html += '<div class="tl-text">' + esc(text) + '</div>';
+        }
         html += '</div>';
       } else if (entry.type === 'B_tool_group') {
         const tgId = key + '_' + ti + '_' + ei;

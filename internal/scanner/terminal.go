@@ -25,16 +25,16 @@ import (
 //	cursor        – Cursor (AI-powered editor, integrated terminal)
 //	hyper         – Hyper (Electron-based terminal)
 var TerminalWhitelist = map[string]bool{
-	"ghostty":      true,
-	"iterm2":        true,
-	"terminal":     true,
-	"warp":         true,
-	"kitty":        true,
-	"alacritty":    true,
-	"wezterm-gui":  true,
-	"code":         true,
-	"cursor":       true,
-	"hyper":        true,
+	"ghostty":     true,
+	"iterm2":      true,
+	"terminal":    true,
+	"warp":        true,
+	"kitty":       true,
+	"alacritty":   true,
+	"wezterm-gui": true,
+	"code":        true,
+	"cursor":      true,
+	"hyper":       true,
 }
 
 // TerminalDetector identifies which terminal emulator a process runs in.
