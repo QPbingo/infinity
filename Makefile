@@ -1,4 +1,4 @@
-.PHONY: build start stop web clean install dev
+.PHONY: build start stop web clean install dev restart reset deploy logs sessions test
 
 BIN_DIR      := $(shell pwd)/bin
 DAEMON       := $(BIN_DIR)/agent-monitor-daemon
@@ -6,6 +6,7 @@ HOOK         := $(BIN_DIR)/agent-monitor-hook
 SETUP        := $(BIN_DIR)/agent-monitor-setup
 DASHBOARD    := http://127.0.0.1:9101
 MONITOR_DIR  := $(HOME)/.agent-monitor
+TOKEN        := $(shell cat $(MONITOR_DIR)/local-token 2>/dev/null)
 
 default: build
 
@@ -115,3 +116,59 @@ clean:
 	@killall agent-monitor-daemon 2>/dev/null || true
 	@rm -rf $(BIN_DIR)
 	@echo "✓ 清理完成"
+
+# 重启 daemon (保留数据)
+restart: build
+	@echo "==> 停止旧 daemon..."
+	@killall agent-monitor-daemon 2>/dev/null || true
+	@sleep 0.5
+	@echo "==> 启动 daemon..."
+	@nohup $(DAEMON) --listen 127.0.0.1:9101 > /tmp/agent-monitor-daemon.log 2>&1 &
+	@sleep 1
+	@if pgrep -f agent-monitor-daemon > /dev/null 2>&1; then \
+		echo "✓ 已重启 → $(DASHBOARD)"; \
+	else \
+		echo "✗ 启动失败，查看日志: cat /tmp/agent-monitor-daemon.log"; \
+	fi
+
+# 完全重置 (清空所有数据 + 重建 + 重启)
+reset: build
+	@echo "==> 停止旧 daemon..."
+	@killall agent-monitor-daemon 2>/dev/null || true
+	@sleep 0.5
+	@echo "==> 清空数据..."
+	@rm -f $(MONITOR_DIR)/daemon.db $(MONITOR_DIR)/events.jsonl $(MONITOR_DIR)/events.offset
+	@echo "==> 启动 daemon..."
+	@nohup $(DAEMON) --listen 127.0.0.1:9101 > /tmp/agent-monitor-daemon.log 2>&1 &
+	@sleep 1
+	@if pgrep -f agent-monitor-daemon > /dev/null 2>&1; then \
+		echo "✓ 已重置 → $(DASHBOARD)"; \
+	else \
+		echo "✗ 启动失败，查看日志: cat /tmp/agent-monitor-daemon.log"; \
+	fi
+
+# 部署插件 + 重启 (开发用: 改完代码一键生效)
+deploy: build
+	@echo "==> 重新安装 OpenCode 插件..."
+	@$(SETUP) uninstall --opencode 2>/dev/null || true
+	@$(SETUP) install --opencode
+	@echo "==> 重启 daemon..."
+	@killall agent-monitor-daemon 2>/dev/null || true
+	@sleep 0.5
+	@nohup $(DAEMON) --listen 127.0.0.1:9101 > /tmp/agent-monitor-daemon.log 2>&1 &
+	@sleep 1
+	@echo "✓ 部署完成 → $(DASHBOARD)"
+	@echo "  ⚠ 还需重启 OpenCode 使新插件生效"
+
+# 查看 daemon 日志
+logs:
+	@tail -30 /tmp/agent-monitor-daemon.log 2>/dev/null || echo "无日志文件"
+
+# 查看所有 session
+sessions:
+	@if [ -z "$(TOKEN)" ]; then echo "未初始化，先运行 make start"; exit 1; fi
+	@curl -sf $(DASHBOARD)/api/sessions -H "X-Daemon-Token: $(TOKEN)" | python3 -c 'import sys,json; [print(f"{s[\"agent_type\"]:10s} {s[\"status\"]:12s} sid={s[\"agent_session_id\"][:30]:30s} turns={len(s.get(\"turns\",[]))}") for s in json.load(sys.stdin)]' 2>/dev/null || echo "daemon 未响应"
+
+# 运行测试
+test:
+	go test ./internal/session/ -v -count=1

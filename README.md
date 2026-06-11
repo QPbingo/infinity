@@ -1,20 +1,47 @@
 # Agent Monitor
 
-本地 AI 编程 Agent 实时监控系统。通过 Hook 机制采集 Claude Code / Codex / OpenCode 的会话事件，提供 Web 看板实时查看。
+本地 AI 编程 Agent 实时监控系统。通过 Hook 机制采集 Claude Code / Codex / OpenCode 的会话事件，提供 Web 看板实时查看。支持从 Web 页面向 OpenCode session 注入 prompt。
 
 ## 架构
 
 ```
 Agent (Hook/Plugin) ──▶ agent-monitor-hook ──▶ events.jsonl ──fsnotify──▶ Daemon ──WS──▶ 浏览器 :9101
-                                                    ▲
-                              PID Scanner (15s) ────┘
-                              (CPU / Memory / Terminal / 死亡检测)
+        ▲                                              ▲
+        │                          PID Scanner (15s) ───┘
+        │                          (CPU / Memory / Terminal / 死亡检测)
+        │
+   Web 输入 ──WS──▶ Daemon ──poll──▶ OpenCode 插件 ──SDK──▶ Agent 执行
+```
+
+## 快速开始
+
+```bash
+make start      # 一键启动 (构建 + 初始化 + 注册 hook + daemon 后台)
+make web        # 打开 Web 看板
+make status     # 查看运行状态
+make stop       # 停止 daemon
+make test       # 运行测试
+```
+
+### 开发常用
+
+```bash
+make restart    # 重建 + 重启 daemon (保留数据)
+make reset      # 重建 + 清空所有数据 + 重启 (完全干净)
+make deploy     # 重建 + 重装 OpenCode 插件 + 重启 daemon
+make logs       # 查看 daemon 日志
+make sessions   # 列出所有 session
+```
+
+### 测试
+
+```bash
+make test-hook SESSION=test-001   # 发送测试事件
 ```
 
 ## 目录结构
 
 ```
-agent-monitor/
 ├── cmd/
 │   ├── daemon/main.go      # Daemon 主进程入口
 │   ├── hook/main.go         # agent-monitor-hook 二进制：被各 agent 的 hook 调用
@@ -23,25 +50,25 @@ agent-monitor/
 │   ├── token/token.go       # Daemon 令牌生成 / 验证 / 常量时间比较
 │   ├── hook/eventwatcher.go # fsnotify 监听 events.jsonl，解析 + 校验 + 转发
 │   ├── session/
-│   │   ├── types.go         # SessionKey / Session / Delta / HookEvent 等核心类型
-│   │   ├── manager.go       # SessionManager：CRUD / Delta 计算 / 字段提取
+│   │   ├── types.go         # SessionKey / Session / Turn / Delta / HookEvent 等类型
+│   │   ├── manager.go       # SessionManager：事件处理 / Turn 构建 / Delta 计算
 │   │   ├── sqlite.go        # SQLite 持久化（modernc.org/sqlite 纯 Go）
-│   │   └── recovery.go      # 启动时从 transcript JSONL 恢复最近 24h 的 session
+│   │   └── recovery.go      # 启动时从 transcript JSONL 恢复 session
 │   ├── scanner/
-│   │   ├── types.go         # ProcessInfo / SessionPIDInfo / SessionUpdater 接口
+│   │   ├── types.go         # ProcessInfo / SessionPIDInfo 等类型
 │   │   ├── scanner.go       # PID Scanner：15s gopsutil 扫描 + fallback 匹配
 │   │   └── terminal.go      # Terminal Detector：PPID 链上溯识别终端
 │   ├── server/
 │   │   ├── server.go        # HTTP 服务启动 / 优雅关闭
 │   │   ├── handlers.go      # REST API + X-Daemon-Token 鉴权中间件
-│   │   └── websocket.go     # WebSocket Hub：注册 / 广播 / 心跳
+│   │   └── websocket.go     # WebSocket Hub：注册 / 广播 / 心跳 / send_input
 │   └── installer/
-│       ├── installer.go     # 通用接口 Installer / Manifest / 备份 / 托管标记
+│       ├── installer.go     # 通用接口 Installer / Manifest / 备份
 │       ├── claude.go        # Claude Code hook 安装到 ~/.claude/settings.json
 │       ├── codex.go         # Codex hook 安装到 ~/.codex/hooks.json
-│       └── opencode.go      # OpenCode JS Plugin 安装到 ~/.config/opencode/plugins/
-├── web/dashboard.html       # Web 看板（单页 HTML，WS 实时更新）
-├── Makefile                 # 一键构建 / 启动 / 停止
+│       └── opencode.go      # OpenCode JS Plugin + 轮询注入
+├── web/dashboard.html       # Web 看板（时间线 + Web 输入）
+├── Makefile                 # 一键构建 / 启动 / 部署 / 测试
 └── go.mod
 ```
 
@@ -49,102 +76,59 @@ agent-monitor/
 
 ### 1. agent-monitor-hook
 
-被各 Agent 的 hook 机制调用的轻量二进制。职责：
+被各 Agent 的 hook 机制调用的轻量二进制：
 - 读取 stdin 中的 Agent hook 原始 JSON
-- 自动提取 `session_id`、`hook_event_name`（参数未传时）
-- 自动读取 `~/.agent-monitor/local-token`（参数未传时）
+- 自动提取 `session_id`、`hook_event_name`
 - 用 `flock` 文件锁原子追加 JSON 行到 `events.jsonl`
+- 完整保留原始 payload
 
-### 2. EventWatcher (internal/hook)
+### 2. EventWatcher
 
 - fsnotify 监听 `events.jsonl` 的 `IN_MODIFY` 事件
-- 通过 `events.offset` 持久化消费位点，实现断线续传
-- 逐行解析 JSON → 校验 token（常量时间比较）→ 转给 SessionManager
-- 启动时 catch-up 读取已写入但未消费的行
+- `events.offset` 持久化消费位点，断线续传
+- 逐行解析 → token 校验 → 转给 SessionManager
 
-### 3. SessionManager (internal/session)
+### 3. SessionManager
 
 - 内存 `map[SessionKey]*Session` + SQLite 双写
-- Hook 事件 → 创建 / 更新 session，提取 `user_input`、`session_title`、`agent_output`、`last_hook_event`
-- PID Scanner 更新 → CPU / Memory / Terminal / CWD
-- 状态机：`active` ↔ `idle` → `stopped` / `disappeared`（可复活）
-- 变更时生成 Delta，通过 Notify 回调推送到 WebSocket Hub
+- 每个 hook 事件 → TurnEntry{Event, Payload}，完整保留原始数据
+- 事件名在 web 端原样展示，不做分类映射
+- Web 输入 → 新 Turn → 存入 pending 队列 → OpenCode 插件轮询注入
+- PID Scanner 更新 CPU/Memory/Terminal/CWD
+- 状态机：`active` ↔ `idle` → `stopped` / `disappeared` / `error`
 
-### 4. PID Scanner (internal/scanner)
+### 4. Web 看板
 
-- 15s Ticker 驱动 gopsutil 全量扫描
-- 进程名匹配：`opencode` / `claude` / `codex` + `node` cmdline 模糊匹配
-- 已绑定 PID 的 session → 更新 CPU / Memory
-- PID 消失 → `MarkDisappeared`
-- PID fallback：记录 PID 找不到时，按 `agent_type + CWD` 搜索匹配
+- 时间线展示：Turn 按时间倒序，最新在最上
+- 每个事件显示原生事件名 + 完整 payload 字段
+- Turn 折叠：最新 Turn 默认展开，其余折叠
+- 工具组折叠：多个 tool 合并显示，展开查看 input/output
+- Web 输入：session card 底部输入框，Send 发送 prompt
+- 长文本 Result 可折叠（>200 字符或 >3 行）
+- Token 持久化到 localStorage，按状态筛选
 
-### 5. Terminal Detector (internal/scanner)
+### 5. Terminal Detector
 
-- 从 Agent PID 出发，沿 PPID 链上溯 ≤10 层
-- 白名单匹配：Ghostty / iTerm2 / Terminal / Warp / kitty / Alacritty / wezterm-gui / VS Code / Cursor / hyper
+- 从 Agent PID 沿 PPID 链上溯 ≤10 层
+- 白名单：Ghostty / iTerm2 / Terminal / Warp / kitty / Alacritty / wezterm-gui / VS Code / Cursor / hyper
 
-### 6. WebSocket Hub (internal/server)
+### 6. Hook 注册
 
-- WS 连接首条消息携带 token 鉴权
-- 鉴权通过 → 推全量 Snapshot → 后续实时广播 Delta
-- 心跳：30s pong，写超时 10s，buffer 满自动断开
-
-### 7. Hook 注册 (internal/installer)
-
-| Agent | 配置文件 | 注册方式 |
-|-------|---------|---------|
-| Claude Code | `~/.claude/settings.json` | 写入 `hooks` 节点，exec form |
-| Codex CLI | `~/.codex/hooks.json` + `config.toml` | 写入 `hooks` + `[features] hooks=true`，shell form |
-| OpenCode | `~/.config/opencode/plugins/agent-monitor.js` | JS Plugin，使用官方 `event` handler 模式 |
-
-- **托管标记**：`"name": "agent-monitor"` 或命令匹配，卸载时只删自身
-- **幂等安装**：重复 install 自动跳过
-- **备份**：修改前备份 `.backup.xxxx` 文件
-
-### 8. Session Recovery
-
-启动时扫描各 Agent 的 transcript JSONL：
-- OpenCode：`~/.config/opencode/sessions/*.jsonl`
-- Claude Code：`~/.claude/projects/*/*.jsonl`
-- Codex：`~/.codex/sessions/**/rollout-*.jsonl`
-
-恢复后立即用 `(agent_type, cwd_hash)` 匹配运行中进程。
-
-### 9. Web 看板
-
-- 单页 HTML，WS 连接 daemon 获取实时数据
-- 卡片式布局，展开显示：标题 / 用户输入 / Agent 输出时间线 / 终端 / 原始 Payload
-- Token 持久化到 localStorage
-- 按状态筛选：Active / Idle / Stopped / Disappeared
-
-## 快速开始
-
-```bash
-# 一键启动（构建 + 初始化 + 注册所有 agent hook + daemon 后台运行）
-make start
-
-# 打开 Web 看板
-make web
-
-# 查看运行状态
-make status
-
-# 停止 daemon
-make stop
-
-# 手动发送测试事件验证链路
-make test-hook SESSION=test-001
-```
+| Agent | 配置文件 | 事件数 |
+|-------|---------|--------|
+| Claude Code | `~/.claude/settings.json` | 30 |
+| Codex CLI | `~/.codex/hooks.json` | 10 |
+| OpenCode | `~/.config/opencode/plugins/agent-monitor.js` | 29 原生 + 12 Part 类型 |
 
 ## 数据存储
 
-| 文件 | 用途 | 权限 |
-|------|------|------|
-| `~/.agent-monitor/device-id` | UUID v4 设备标识 | 0600 |
-| `~/.agent-monitor/local-token` | 256bit Base64 令牌 | 0600 |
-| `~/.agent-monitor/events.jsonl` | Hook 事件缓冲 | 0600 |
-| `~/.agent-monitor/events.offset` | 消费位点 (int64) | 0600 |
-| `~/.agent-monitor/daemon.db` | SQLite 持久化 | 0600 |
+| 文件 | 用途 |
+|------|------|
+| `~/.agent-monitor/device-id` | UUID v4 设备标识 |
+| `~/.agent-monitor/local-token` | 256bit Base64 令牌 |
+| `~/.agent-monitor/events.jsonl` | Hook 事件缓冲 |
+| `~/.agent-monitor/events.offset` | 消费位点 |
+| `~/.agent-monitor/daemon.db` | SQLite 持久化 (含 turns JSON) |
 
 ## HTTP API
 
@@ -152,9 +136,24 @@ make test-hook SESSION=test-001
 |------|------|------|------|
 | GET | `/api/sessions` | X-Daemon-Token | 全部 session |
 | GET | `/api/sessions/:key` | X-Daemon-Token | 单个 session |
+| GET | `/api/sessions/:key/pending-input` | X-Daemon-Token | 获取待注入输入 (200) 或无 (204) |
+| GET | `/api/poll-input?agent_type=x&agent_session_id=x` | X-Daemon-Token | 插件轮询端点 |
 | GET | `/health` | X-Daemon-Token | 健康检查 |
-| GET | `/ws` | WS 首条消息携 token | WebSocket |
+| GET | `/ws` | WS 首条消息 token | WebSocket |
 | GET | `/` | 无 | 看板页面 |
+
+## WebSocket 消息
+
+| 方向 | type | 说明 |
+|------|------|------|
+| C→S | `auth` | 鉴权 `{type, token}` |
+| S→C | `auth_ok` / `auth_error` | 鉴权结果 |
+| S→C | `snapshot` | 全量 session 快照 |
+| S→C | `delta` | 增量更新 `{session_key, changes}` |
+| S→C | `session_added` | 新 session 出现 |
+| C→S | `send_input` | Web 输入 `{session_key, text}` |
+| C→S | `ping` | 心跳 |
+| S→C | `pong` | 心跳回复 |
 
 ## Daemon 参数
 
@@ -171,7 +170,7 @@ make test-hook SESSION=test-001
 | 标识 | user_id, device_id, agent_type, agent_session_id, session_key | Hook |
 | 进程 | pid, terminal, cwd, memory_mb, cpu_percent | PID Scanner |
 | 事件 | status, start_time_ms, last_event_time_ms, last_event_type, last_hook_event | Hook |
-| 内容 | user_input, session_title, agent_output, last_file, last_command, payload | Hook 提取 |
+| 内容 | user_input, session_title, agent_output, turns | Hook 提取 |
 | 状态 | turn_count, git_branch | Hook |
 
 ## SessionKey 计算

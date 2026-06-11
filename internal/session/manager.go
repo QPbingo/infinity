@@ -9,30 +9,8 @@ import (
 	"github.com/heybox/agent-monitor/internal/scanner"
 )
 
-// NotifyFunc is a callback that SessionManager calls when sessions change.
-// Injected via SetNotify(), typically wired to WebSocket Hub for real-time
-// dashboard updates.
-//
-// Parameters:
-//   - eventType: "delta" (incremental change) or "session_added" (new session)
-//   - data:      *Delta for "delta", *Session for "session_added"
 type NotifyFunc func(eventType string, data interface{})
 
-// SessionManager is the central state store for all agent sessions.
-//
-// It maintains an in-memory map of sessions keyed by SessionKey, protected
-// by a sync.RWMutex for concurrent access from:
-//   - EventWatcher goroutine (HandleEvent – hook events from agents)
-//   - PID Scanner goroutine (HandlePidUpdate, MarkDisappeared, CheckIdleSessions)
-//   - HTTP handlers (GetSessions, GetSession – REST API reads)
-//   - WebSocket Hub (GetSnapshot – full state for new clients)
-//
-// All write operations also persist to SQLite to survive daemon restarts.
-// Process-field-only updates use a lighter UpdateProcessFields() to avoid
-// contention with hook event writes.
-//
-// The notification callback (SetNotify) bridges SessionManager to the WebSocket
-// Hub without creating a circular dependency.
 type SessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
@@ -41,13 +19,9 @@ type SessionManager struct {
 
 	userID        string
 	deviceID      string
-	pendingInputs map[string]string // sessionKey → prompt text, polled by OpenCode plugin
+	pendingInputs map[string]string
 }
 
-// NewSessionManager creates a new session manager with the given store and identity.
-//
-// After creation, call LoadFromStore() to restore persisted sessions,
-// then call SetNotify() to wire up the notification callback.
 func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	return &SessionManager{
 		sessions:      make(map[string]*Session),
@@ -58,30 +32,10 @@ func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	}
 }
 
-// SetNotify registers a callback that fires on every session change.
-//
-// Called once during startup in main.go:
-//
-//	mgr.SetNotify(func(eventType string, data interface{}) {
-//	    srv.GetHub().Notify(eventType, data)
-//	})
-//
-// This decouples SessionManager from the WebSocket layer – SessionManager
-// doesn't need to know how real-time updates are delivered.
-func (sm *SessionManager) SetNotify(fn NotifyFunc) {
-	sm.notify = fn
-}
+func (sm *SessionManager) SetNotify(fn NotifyFunc) { sm.notify = fn }
+func (sm *SessionManager) UserID() string          { return sm.userID }
+func (sm *SessionManager) DeviceID() string        { return sm.deviceID }
 
-func (sm *SessionManager) UserID() string  { return sm.userID }
-func (sm *SessionManager) DeviceID() string { return sm.deviceID }
-
-// LoadFromStore restores all sessions from SQLite into the in-memory map.
-//
-// Called once at startup after SQLite initialization.
-// Skips duplicate sessions (same SessionKey) that already exist in memory.
-// This is a full restore – all fields including process metrics and hook data
-// are loaded. Sessions that were "active" or "idle" in the last run will be
-// restored with those statuses; the PID Scanner will verify or update them.
 func (sm *SessionManager) LoadFromStore() {
 	sessions, err := sm.store.LoadAll()
 	if err != nil {
@@ -98,60 +52,17 @@ func (sm *SessionManager) LoadFromStore() {
 	log.Printf("[session] loaded %d sessions from store", len(sessions))
 }
 
-// HandleEvent processes a hook event from the EventWatcher.
-//
-// This is the primary data ingestion method. It is called synchronously from
-// the EventWatcher's goroutine for each valid event line in events.jsonl.
-//
-// Processing flow:
-//
-//	1. Map raw event name to standardized EventType (via HookToEventType).
-//	   If the event name is not in the map, use the raw name as the type.
-//
-//	2. Compute SessionKey and look up (or create) the session in the in-memory map.
-//
-//	3. For a new session:
-//	   a. Reject "Stop"/"session_end" events – a session_end without a prior
-//	      session_start is a stale event, ignore it.
-//	   b. Create a new Session with Status=active, set StartTimeMs to event time.
-//	   c. Apply the event's data (user input, tool info, etc.) via applyEvent().
-//	   d. Upsert to SQLite.
-//	   e. Notify "session_added" to WebSocket clients.
-//
-//	4. For an existing session:
-//	   a. Save a copy of the old state (old := *sess).
-//	   b. Handle specific event types:
-//	      - session_start: Reset status to Active, update CWD/PID/lastHookTime.
-//	                        This handles session restart within the same agent process.
-//	      - session_end:   Set Status to Stopped, extract model output from payload.
-//	                        Stopped is terminal – only session_start can restart it.
-//	      - default:       Apply event via applyEvent() (updates turns, tools, output).
-//	   c. Upsert to SQLite.
-//	   d. Compute delta (diff old vs. new) and notify "delta" if anything changed.
-//
-// Thread safety: Holds write lock for the entire duration to prevent races
-// with PID Scanner operations.
 func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Normalize agent-specific event names to standardized EventType
-	eventType, ok := HookToEventType[event.Event]
-	if !ok {
-		eventType = EventType(event.Event)
-	}
-
 	key := ComputeSessionKey(sm.userID, sm.deviceID, event.AgentType, event.SessionID)
 	sess, exists := sm.sessions[key]
 
-	// ── Case 1: New session (first time seeing this key) ────────────────
 	if !exists {
-		// Reject stale session_end events for unknown sessions
 		if event.Event == "Stop" || event.Event == "session_end" {
 			return
 		}
-
-		// Create brand-new session with initial state
 		sess = &Session{
 			UserID:         sm.userID,
 			DeviceID:       sm.deviceID,
@@ -163,20 +74,12 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 			Payload:        event.Payload,
 		}
 		sm.sessions[key] = sess
-
-		// Apply event data: extracts user input, tool info, model output
-		// based on the event type (user_prompt, tool_use, notification).
-		sess.applyEvent(event, eventType)
-
-		// Persist to SQLite so this session survives daemon restart
+		sess.applyEvent(event)
 		if sm.store != nil {
 			if err := sm.store.Upsert(sess); err != nil {
 				log.Printf("[session] upsert new session: %v", err)
 			}
 		}
-
-		// Notify dashboard that a new session appeared
-		// Payload is stripped from the clone for privacy/bandwidth
 		if sm.notify != nil {
 			clone := *sess
 			clone.Payload = nil
@@ -185,67 +88,35 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		return
 	}
 
-	// ── Case 2: Existing session – update state based on event type ─────
-	old := *sess // snapshot before mutation for delta computation
+	old := *sess
 
-	switch string(eventType) {
-	case "session_start":
+	switch event.Event {
+	case "SessionStart", "session_start":
 		sess.Status = StatusActive
 		sess.StartTimeMs = event.TimestampMs
-		sess.LastEventTimeMs = event.TimestampMs
-		sess.LastEventType = string(eventType)
-		sess.LastHookEvent = event.Event
-		sess.CWD = event.CWD
-		sess.PID = event.PID
-		sess.lastHookTime = event.TimestampMs
-		sess.Payload = event.Payload
-
-	case "stop":
+	case "Stop", "session_end":
 		sess.Status = StatusStopped
-		sess.LastEventTimeMs = event.TimestampMs
-		sess.LastEventType = string(eventType)
-		sess.LastHookEvent = event.Event
-		sess.lastHookTime = event.TimestampMs
-		sess.extractModelOutput(event.Payload)
-		finalText := extractStringField(event.Payload, "model_output", "output", "last_assistant_message", "text", "response")
-		if finalText != "" && len(sess.Turns) > 0 {
-			turn := &sess.Turns[len(sess.Turns)-1]
-			turn.Entries = append(turn.Entries, TurnEntry{
-				Type: "A_result",
-				Text: finalText,
-				TS:   event.TimestampMs,
-			})
-		}
-
-	case "session_error", "stop_failure":
+	case "SessionError", "StopFailure", "session_error", "stop_failure":
 		sess.Status = StatusError
-		sess.LastEventTimeMs = event.TimestampMs
-		sess.LastEventType = string(eventType)
-		sess.LastHookEvent = event.Event
-		sess.lastHookTime = event.TimestampMs
-		sess.applyEvent(event, eventType)
-
-	case "session_close":
+	case "SessionEnd", "SessionClose", "SessionDeleted", "session_close", "session_deleted":
 		sess.Status = StatusStopped
-		sess.LastEventTimeMs = event.TimestampMs
-		sess.LastEventType = string(eventType)
-		sess.LastHookEvent = event.Event
-		sess.lastHookTime = event.TimestampMs
-		sess.applyEvent(event, eventType)
-
-	default:
-		sess.applyEvent(event, eventType)
 	}
 
-	// Persist the updated session state to SQLite
+	sess.LastEventTimeMs = event.TimestampMs
+	sess.LastEventType = event.Event
+	sess.LastHookEvent = event.Event
+	sess.CWD = event.CWD
+	sess.PID = event.PID
+	sess.lastHookTime = event.TimestampMs
+	sess.Payload = event.Payload
+	sess.applyEvent(event)
+
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] upsert session: %v", err)
 		}
 	}
 
-	// Compute what changed and notify dashboards via WebSocket
-	// computeDelta() returns nil if nothing changed (same field values)
 	if sm.notify != nil {
 		delta := sm.computeDelta(&old, sess)
 		if delta != nil {
@@ -254,91 +125,54 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	}
 }
 
-// applyEvent updates a Session's fields based on a hook event.
-//
-// Always updates: LastEventTimeMs, LastEventType, LastHookEvent, CWD, PID,
-// lastHookTime, Payload, and sets Status to Active.
-//
-// Type-specific updates:
-//
-//	user_prompt:
-//	  - Increments TurnCount
-//	  - Extracts user input text from payload (searches for keys: prompt,
-//	    user_input, text, message)
-//	  - If SessionTitle is empty, sets it to the first user input
-//
-//	pre_tool_use / post_tool_use:
-//	  - Extracts tool name and file path from payload
-//	  - Extracts tool input (command, filePath) from payload
-//	  - Appends a formatted line to AgentOutput: "[HH:MM:SS] <event> <tool> → <output>"
-//
-//	notification:
-//	  - Extracts model output text from payload (searches for keys:
-//	    last_assistant_message, model_output, output, text, response)
-//	  - Appends to AgentOutput: "[model] <text>"
-func (s *Session) applyEvent(event *HookEvent, eventType EventType) {
-	// ── Always-updated fields ──────────────────────────────────────────
+func (s *Session) applyEvent(event *HookEvent) {
 	s.LastEventTimeMs = event.TimestampMs
-	s.LastEventType = string(eventType)
+	s.LastEventType = event.Event
 	s.LastHookEvent = event.Event
 	s.CWD = event.CWD
 	s.PID = event.PID
-	s.lastHookTime = event.TimestampMs // for idle detection
+	s.lastHookTime = event.TimestampMs
 	s.Payload = event.Payload
 
-	// ── Turn building ─────────────────────────────────────────────────
-	s.buildTurnEntry(event, eventType)
+	s.buildTurnEntry(event)
 
-	// ── Type-specific field extraction ─────────────────────────────────
-	switch eventType {
-	case EventUserPrompt:
+	oldStatus := s.Status
+	switch event.Event {
+	case "UserPromptSubmit":
 		s.TurnCount++
 		s.extractUserInput(event.Payload)
 		if s.SessionTitle == "" && s.UserInput != "" {
 			s.SessionTitle = s.UserInput
 		}
-
-	case EventPostToolUse:
+	case "PostToolUse":
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
-
-	case EventPreToolUse:
+	case "PreToolUse":
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
-
-	case EventAssistantText:
+	case "AssistantText", "ReasoningPart":
 		s.extractModelOutput(event.Payload)
-
-	case EventSessionError, EventStopFailure:
+	case "SessionError", "StopFailure", "session_error", "stop_failure":
 		s.Status = StatusError
 		return
-
-	case EventSessionClose:
+	case "SessionEnd", "SessionClose", "SessionDeleted", "session_close", "session_deleted":
 		s.Status = StatusStopped
 		return
 	}
 
-	s.Status = StatusActive
+	if oldStatus != StatusError && oldStatus != StatusStopped {
+		if s.Status != StatusError && s.Status != StatusStopped {
+			s.Status = StatusActive
+		}
+	}
 }
 
-// buildTurnEntry constructs Turn entries from hook events.
-//
-// Turn lifecycle:
-//   UserPromptSubmit → starts a new turn with user_input
-//   Notification(type=thinking) → adds A_thinking entry
-//   PreToolUse → opens or adds to B_tool_group entry
-//   PostToolUse → completes tool in B_tool_group entry
-//   Notification(type=result) → adds A_result entry
-func (s *Session) buildTurnEntry(event *HookEvent, eventType EventType) {
-	// If web input created this turn, clear the flag when any model event arrives
-	if s.webInputActive && eventType != EventUserPrompt && eventType != EventSessionStart {
-		s.webInputActive = false
-	}
-
-	switch eventType {
-	case EventUserPrompt:
+func (s *Session) buildTurnEntry(event *HookEvent) {
+	switch event.Event {
+	case "UserPromptSubmit":
 		if s.webInputActive {
-			return // skip duplicate turn from plugin-injected prompt
+			s.webInputActive = false
+			return
 		}
 		input := extractStringField(event.Payload, "prompt", "user_input", "text", "message")
 		s.Turns = append(s.Turns, Turn{
@@ -348,299 +182,53 @@ func (s *Session) buildTurnEntry(event *HookEvent, eventType EventType) {
 			Entries:   []TurnEntry{},
 		})
 
-	case EventAssistantText:
-		s.addNotificationToTurn(event)
-
-	case EventPreToolUse:
+	case "PreToolUse":
 		s.addToolRunning(event)
 
-	case EventPostToolUse:
+	case "PostToolUse":
 		s.completeTool(event)
 
-	case EventToolFailure:
+	case "PostToolUseFailure":
 		s.failTool(event)
 
-	case EventPermission:
-		s.addPermissionEntry(event)
-
-	case EventSubagent:
-		s.addSubagentEntry(event)
-
-	case EventCompact:
-		s.addCompactEntry(event)
-
-	case EventSessionError, EventStopFailure:
-		s.addErrorEntry(event)
-
-	case EventPostToolBatch:
-		s.addInfoEntry(event, "PostToolBatch")
-
-	case EventInfo:
-		s.addInfoEntry(event, event.Event)
-	}
-}
-
-func (s *Session) ensureTurn() *Turn {
-	if len(s.Turns) == 0 {
-		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: 0, Entries: []TurnEntry{}})
-	}
-	return &s.Turns[len(s.Turns)-1]
-}
-
-func (s *Session) failTool(event *HookEvent) {
-	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
-	toolOutput := extractToolOutput(event.Payload)
-	reason := extractStringField(event.Payload, "reason", "error", "message")
-	if toolName == "" {
-		return
-	}
-	s.ensureTurn()
-	turn := s.ensureTurn()
-	found := false
-	for i := len(turn.Entries) - 1; i >= 0; i-- {
-		if turn.Entries[i].Type == "B_tool_group" {
-			for j := len(turn.Entries[i].Tools) - 1; j >= 0; j-- {
-				if turn.Entries[i].Tools[j].Status == "running" && turn.Entries[i].Tools[j].Name == toolName {
-					turn.Entries[i].Tools[j].Status = "error"
-					turn.Entries[i].Tools[j].Output = reason
-					if toolOutput != "" {
-						turn.Entries[i].Tools[j].Output = toolOutput
-					}
-					turn.Entries[i].Tools[j].EndTS = event.TimestampMs
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
+	default:
+		if s.webInputActive {
+			s.webInputActive = false
 		}
-	}
-	if !found {
-		tc := ToolCall{
-			Name:    toolName,
-			Status:  "error",
-			Output:  firstNonEmpty(reason, toolOutput),
-			StartTS: event.TimestampMs,
-			EndTS:   event.TimestampMs,
-		}
-		addToolToGroup(turn, tc, event.TimestampMs)
+		s.addEventEntry(event)
 	}
 }
 
-func (s *Session) addPermissionEntry(event *HookEvent) {
-	subtype := event.Event
-	text := buildPermissionText(event)
-	if text == "" {
-		return
-	}
+func (s *Session) addEventEntry(event *HookEvent) {
 	s.ensureTurn()
 	turn := s.ensureTurn()
 	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "B_permission",
-		Subtype: subtype,
-		Text:    text,
+		Event:   event.Event,
 		TS:      event.TimestampMs,
+		Payload: event.Payload,
 	})
 }
 
-func buildPermissionText(event *HookEvent) string {
-	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
-	reason := extractStringField(event.Payload, "reason", "permissionDecisionReason", "message", "decisionReason")
-	decision := extractStringField(event.Payload, "permissionDecision", "decision", "behavior")
-	if toolName != "" && decision != "" {
-		return toolName + ": " + decision + (map[bool]string{true: " — " + reason, false: ""}[reason != ""])
-	}
-	if toolName != "" {
-		return toolName
-	}
-	if reason != "" {
-		return reason
-	}
-	return extractStringField(event.Payload, "text", "message", "description")
-}
-
-func (s *Session) addSubagentEntry(event *HookEvent) {
-	agentType := extractStringField(event.Payload, "agent_type", "agentType", "type")
-	agentID := extractStringField(event.Payload, "agent_id", "agentId", "id")
-	text := agentType
-	if agentID != "" {
-		text = agentType + " (" + agentID + ")"
-	}
-	if text == "" {
-		text = event.Event
-	}
-	s.ensureTurn()
-	turn := s.ensureTurn()
-	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "B_subagent",
-		Subtype: event.Event,
-		Text:    text,
-		TS:      event.TimestampMs,
-	})
-}
-
-func (s *Session) addCompactEntry(event *HookEvent) {
-	trigger := extractStringField(event.Payload, "trigger", "source", "reason")
-	text := "Context compacted"
-	if trigger != "" {
-		text += " (" + trigger + ")"
-	}
-	s.ensureTurn()
-	turn := s.ensureTurn()
-	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "B_compact",
-		Subtype: event.Event,
-		Text:    text,
-		TS:      event.TimestampMs,
-	})
-}
-
-func (s *Session) addErrorEntry(event *HookEvent) {
-	reason := extractStringField(event.Payload, "reason", "error", "message", "text", "model_output")
-	errorType := extractStringField(event.Payload, "error_type", "type", "status")
-	text := event.Event
-	if errorType != "" {
-		text += ": " + errorType
-	}
-	if reason != "" {
-		text += " — " + reason
-	}
-	s.ensureTurn()
-	turn := s.ensureTurn()
-	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "error",
-		Subtype: event.Event,
-		Text:    text,
-		TS:      event.TimestampMs,
-	})
-}
-
-func (s *Session) addInfoEntry(event *HookEvent, label string) {
-	text := buildInfoText(event, label)
-	if text == "" {
-		return
-	}
-	s.ensureTurn()
-	turn := s.ensureTurn()
-	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "info",
-		Subtype: event.Event,
-		Text:    text,
-		TS:      event.TimestampMs,
-	})
-}
-
-func buildInfoText(event *HookEvent, label string) string {
-	parts := []string{label}
-	if file := extractStringField(event.Payload, "filePath", "file_path", "file", "path", "filename"); file != "" {
-		parts = append(parts, file)
-	}
-	if cwd := extractStringField(event.Payload, "cwd", "directory"); cwd != "" {
-		parts = append(parts, cwd)
-	}
-	if cmd := extractStringField(event.Payload, "command", "tool_name", "tool"); cmd != "" {
-		parts = append(parts, cmd)
-	}
-	if src := extractStringField(event.Payload, "source", "trigger", "reason", "notification_type"); src != "" {
-		parts = append(parts, src)
-	}
-	if text := extractStringField(event.Payload, "text", "message", "description"); text != "" {
-		parts = append(parts, text)
-	}
-	if len(parts) == 1 {
-		return label
-	}
-	return joinNonEmpty(parts, " | ")
-}
-
-func addToolToGroup(turn *Turn, tc ToolCall, ts int64) {
-	for i := len(turn.Entries) - 1; i >= 0; i-- {
-		if turn.Entries[i].Type == "B_tool_group" {
-			turn.Entries[i].Tools = append(turn.Entries[i].Tools, tc)
-			return
-		}
-	}
-	turn.Entries = append(turn.Entries, TurnEntry{
-		Type:    "B_tool_group",
-		Tools:   []ToolCall{tc},
-		StartTS: ts,
-	})
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-func joinNonEmpty(parts []string, sep string) string {
-	var out []string
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	if len(out) == 0 {
-		return ""
-	}
-	result := out[0]
-	for i := 1; i < len(out); i++ {
-		result += sep + out[i]
-	}
-	return result
-}
-
-// addNotificationToTurn adds an A_thinking or A_result entry to the current turn.
-func (s *Session) addNotificationToTurn(event *HookEvent) {
-	entryType := extractStringField(event.Payload, "type")
-	if entryType == "" {
-		entryType = "A_result"
-	}
-	text := extractStringField(event.Payload, "text", "last_assistant_message", "model_output", "output", "response", "message")
-	if text == "" {
-		return
-	}
-	if len(s.Turns) == 0 {
-		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: event.TimestampMs, Entries: []TurnEntry{}})
-	}
-	turn := &s.Turns[len(s.Turns)-1]
-	entry := TurnEntry{
-		Type: entryType,
-		Text: text,
-		TS:   event.TimestampMs,
-	}
-	turn.Entries = append(turn.Entries, entry)
-}
-
-// addToolRunning opens a tool call in a B_tool_group entry (or creates a new group).
 func (s *Session) addToolRunning(event *HookEvent) {
 	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
 	toolInput := extractToolInput(event.Payload)
 	if toolName == "" {
 		return
 	}
-	if len(s.Turns) == 0 {
-		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: event.TimestampMs, Entries: []TurnEntry{}})
-	}
-	turn := &s.Turns[len(s.Turns)-1]
-	tc := ToolCall{
-		Name:    toolName,
-		Input:   toolInput,
-		Status:  "running",
-		StartTS: event.TimestampMs,
-	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	tc := ToolCall{Name: toolName, Input: toolInput, Status: "running", StartTS: event.TimestampMs}
 	var group *TurnEntry
 	for i := len(turn.Entries) - 1; i >= 0; i-- {
-		if turn.Entries[i].Type == "B_tool_group" {
+		if len(turn.Entries[i].Tools) > 0 {
 			group = &turn.Entries[i]
 			break
 		}
 	}
 	if group == nil {
 		turn.Entries = append(turn.Entries, TurnEntry{
-			Type:    "B_tool_group",
+			Event:   event.Event,
+			Payload: event.Payload,
 			Tools:   []ToolCall{tc},
 			StartTS: event.TimestampMs,
 		})
@@ -649,7 +237,6 @@ func (s *Session) addToolRunning(event *HookEvent) {
 	}
 }
 
-// completeTool finds the running tool in the current turn and marks it completed.
 func (s *Session) completeTool(event *HookEvent) {
 	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
 	toolOutput := extractToolOutput(event.Payload)
@@ -662,22 +249,57 @@ func (s *Session) completeTool(event *HookEvent) {
 	}
 	turn := &s.Turns[len(s.Turns)-1]
 	for i := len(turn.Entries) - 1; i >= 0; i-- {
-		if turn.Entries[i].Type == "B_tool_group" {
-			group := &turn.Entries[i]
-			for j := len(group.Tools) - 1; j >= 0; j-- {
-				tc := &group.Tools[j]
-				if tc.Status == "running" && (toolName == "" || tc.Name == toolName) {
-					tc.Status = status
-					tc.Output = toolOutput
-					tc.EndTS = event.TimestampMs
-					return
-				}
+		entry := &turn.Entries[i]
+		for j := len(entry.Tools) - 1; j >= 0; j-- {
+			tc := &entry.Tools[j]
+			if tc.Status == "running" && (toolName == "" || tc.Name == toolName) {
+				tc.Status = status
+				tc.Output = toolOutput
+				tc.EndTS = event.TimestampMs
+				return
 			}
 		}
 	}
 }
 
-// extractStringField pulls a string value from a JSON payload by trying multiple keys.
+func (s *Session) failTool(event *HookEvent) {
+	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
+	toolOutput := extractToolOutput(event.Payload)
+	reason := extractStringField(event.Payload, "reason", "error", "message")
+	if toolName == "" {
+		return
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	for i := len(turn.Entries) - 1; i >= 0; i-- {
+		entry := &turn.Entries[i]
+		for j := len(entry.Tools) - 1; j >= 0; j-- {
+			tc := &entry.Tools[j]
+			if tc.Status == "running" && tc.Name == toolName {
+				tc.Status = "error"
+				if toolOutput != "" {
+					tc.Output = toolOutput
+				} else {
+					tc.Output = reason
+				}
+				tc.EndTS = event.TimestampMs
+				return
+			}
+		}
+	}
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Event: event.Event,
+		Tools: []ToolCall{{Name: toolName, Status: "error", Output: firstNonEmpty(reason, toolOutput), StartTS: event.TimestampMs, EndTS: event.TimestampMs}},
+	})
+}
+
+func (s *Session) ensureTurn() *Turn {
+	if len(s.Turns) == 0 {
+		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: 0, Entries: []TurnEntry{}})
+	}
+	return &s.Turns[len(s.Turns)-1]
+}
+
 func extractStringField(payload json.RawMessage, keys ...string) string {
 	if len(payload) == 0 {
 		return ""
@@ -694,7 +316,6 @@ func extractStringField(payload json.RawMessage, keys ...string) string {
 	return ""
 }
 
-// extractToolInput extracts the tool input from a payload (command, filePath, or first key).
 func extractToolInput(payload json.RawMessage) string {
 	if len(payload) == 0 {
 		return ""
@@ -733,7 +354,6 @@ func extractToolInput(payload json.RawMessage) string {
 	return ""
 }
 
-// extractToolOutput extracts the tool output from a payload.
 func extractToolOutput(payload json.RawMessage) string {
 	if len(payload) == 0 {
 		return ""
@@ -759,15 +379,6 @@ func extractToolOutput(payload json.RawMessage) string {
 	return ""
 }
 
-// extractUserInput extracts user prompt text from the event payload.
-//
-// Searches for common key names used across different agents:
-//   - "prompt" (opencode)
-//   - "user_input" (claude code)
-//   - "text" (generic)
-//   - "message" (generic)
-//
-// The first non-empty string value found is stored in s.UserInput.
 func (s *Session) extractUserInput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -784,25 +395,6 @@ func (s *Session) extractUserInput(payload json.RawMessage) {
 	}
 }
 
-// appendAgentOutput extracts tool invocation info from the event payload
-// and appends a formatted log line to AgentOutput.
-//
-// Format: "[HH:MM:SS] <hook_event> <tool_name> → <tool_output/command/file>"
-//
-// Examples:
-//
-//	"[14:25:03] PreToolUse Bash → ls -la"
-//	"[14:25:05] PostToolUse Read → /path/to/file.go"
-//	"[14:26:01] PreToolUse Write → main.go"
-//
-// The tool name is extracted from "tool_name" or "tool" keys.
-// The tool output/command is extracted from:
-//   - "tool_output" or "output" keys (direct output)
-//   - "tool_input.command" (shell commands from bash tool)
-//   - "tool_input.filePath"/"file_path"/"path" (file operations)
-//   - If only tool_input with no recognizable keys, shows first key name
-//
-// AgentOutput accumulates across events, separated by newlines.
 func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -811,19 +403,14 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
-
-	// Extract tool name from "tool_name" or "tool" keys
 	toolName, _ := data["tool_name"].(string)
 	if toolName == "" {
 		toolName, _ = data["tool"].(string)
 	}
-
-	// Extract tool output from various possible locations
 	output, _ := data["tool_output"].(string)
 	if output == "" {
 		output, _ = data["output"].(string)
 	}
-	// If no direct output, try to extract from tool_input sub-object
 	if output == "" {
 		if toolInput, ok := data["tool_input"].(map[string]interface{}); ok {
 			if cmd, ok := toolInput["command"].(string); ok {
@@ -835,7 +422,6 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 			} else if fp, ok := toolInput["path"].(string); ok {
 				output = fp
 			} else {
-				// Unknown tool input structure – show the first key name
 				keys := make([]string, 0, len(toolInput))
 				for k := range toolInput {
 					keys = append(keys, k)
@@ -846,8 +432,6 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 			}
 		}
 	}
-
-	// Build the log line: tool name or output is required
 	line := ""
 	if toolName != "" {
 		line = "[" + toolName + "]"
@@ -861,8 +445,6 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	if line == "" {
 		return
 	}
-
-	// Format: "[HH:MM:SS] <event_type> <tool_name> → <output>"
 	ts := time.Now().Format("15:04:05")
 	if s.AgentOutput != "" {
 		s.AgentOutput += "\n"
@@ -879,16 +461,6 @@ func (s *Session) appendAgentOutput(payload json.RawMessage) {
 	}
 }
 
-// extractModelOutput extracts the model's textual response from the payload.
-//
-// Searches for common key names across agents:
-//   - "last_assistant_message" (opencode)
-//   - "model_output" (claude code)
-//   - "output" (generic)
-//   - "text" (generic)
-//   - "response" (generic)
-//
-// Appends to AgentOutput as: "[model] <model response text>"
 func (s *Session) extractModelOutput(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -908,16 +480,6 @@ func (s *Session) extractModelOutput(payload json.RawMessage) {
 	}
 }
 
-// extractToolInfo extracts the tool name and file path from an event payload.
-//
-// Separates tool identification into:
-//   - LastCommand: the tool/command name (e.g. "Bash", "Read", "Edit")
-//     Sources: "tool", "tool_name", "command"
-//   - LastFile: the file path being operated on (e.g. "/path/to/file.go")
-//     Sources: payload direct "filePath"/"file"/"file" keys,
-//              or nested "input.filePath"/"input.file_path"/"input.path"
-//
-// This provides the dashboard with quick context on what the agent is doing.
 func (s *Session) extractToolInfo(payload json.RawMessage) {
 	if len(payload) == 0 {
 		return
@@ -926,8 +488,6 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
-
-	// Extract tool/command name
 	if tool, ok := data["tool"].(string); ok {
 		s.LastCommand = tool
 	} else if tool, ok := data["tool_name"].(string); ok {
@@ -935,8 +495,6 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	} else if tool, ok := data["command"].(string); ok {
 		s.LastCommand = tool
 	}
-
-	// Extract file path from input sub-object
 	if input, ok := data["input"].(map[string]interface{}); ok {
 		if fp, ok := input["filePath"].(string); ok {
 			s.LastFile = fp
@@ -946,8 +504,6 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 			s.LastFile = fp
 		}
 	}
-
-	// Extract file path from top-level payload (higher priority)
 	if file, ok := data["filePath"].(string); ok {
 		s.LastFile = file
 	} else if file, ok := data["file"].(string); ok {
@@ -955,30 +511,20 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	}
 }
 
-// HandleWebInput processes a user prompt sent from the web dashboard.
-//
-// Called from the WebSocket handler when a dashboard client sends a send_input message.
-// Writes the prompt as a new Turn in the session timeline, persists to SQLite,
-// stores it for the OpenCode plugin to pick up via polling, and notifies all
-// WebSocket clients of the turn update.
 func (sm *SessionManager) HandleWebInput(key string, text string) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	sess, ok := sm.sessions[key]
 	if !ok {
 		return false
 	}
-
 	old := *sess
-
 	sess.TurnCount++
 	sess.UserInput = text
 	sess.LastEventTimeMs = time.Now().UnixMilli()
-	sess.LastEventType = "user_prompt"
+	sess.LastEventType = "WebInput"
 	sess.LastHookEvent = "WebInput"
 	sess.lastHookTime = time.Now().UnixMilli()
-
 	sess.Turns = append(sess.Turns, Turn{
 		TurnIdx:   len(sess.Turns),
 		UserInput: text,
@@ -986,27 +532,21 @@ func (sm *SessionManager) HandleWebInput(key string, text string) bool {
 		Entries:   []TurnEntry{},
 	})
 	sess.webInputActive = true
-
 	sm.pendingInputs[key] = text
-
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] upsert web input: %v", err)
 		}
 	}
-
 	if sm.notify != nil {
 		delta := sm.computeDelta(&old, sess)
 		if delta != nil {
 			sm.notify("delta", delta)
 		}
 	}
-
 	return true
 }
 
-// GetPendingInput returns and clears the pending web input for a session key.
-// Called by the OpenCode plugin via HTTP polling.
 func (sm *SessionManager) GetPendingInput(key string) string {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -1015,174 +555,89 @@ func (sm *SessionManager) GetPendingInput(key string) string {
 	return text
 }
 
-// HandlePidUpdate is called by PID Scanner when an agent process is found alive.
-//
-// This is the primary way process-level metrics flow into the session manager.
-// Only updates fields that changed meaningfully to avoid unnecessary notifications
-// and database writes.
-//
-// Update thresholds (avoid noisy updates for floating values):
-//   - CPU:     change must exceed 0.1 percentage points
-//   - Memory:  change must exceed 0.5 MB
-//
-// Special behavior:
-//   - If session status is Disappeared, resurrects it to Active.
-//     This handles the case where a process briefly vanished from the process
-//     table (e.g., during fork/exec) but is actually still running.
-//
-// Uses the lighter UpdateProcessFields() SQLite method (only writes process
-// fields, not full session data) to reduce write contention with hook events.
 func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	sess, ok := sm.sessions[key]
 	if !ok {
 		return
 	}
-
 	changed := false
-
-	// Update PID if it changed (e.g., agent restarted with new PID but same CWD)
 	if sess.PID != int(info.PID) {
 		sess.PID = int(info.PID)
 		changed = true
 	}
-
-	// Update CWD if the process moved directories (unusual but possible via os.Chdir)
 	if sess.CWD != info.CWD && info.CWD != "" {
 		sess.CWD = info.CWD
 		changed = true
 	}
-
-	// Update CPU percentage only if change exceeds noise threshold (0.15%)
 	if diff := abs(sess.CPUPercent - info.CPUPercent); diff > 0.1 {
 		sess.CPUPercent = info.CPUPercent
 		changed = true
 	}
-
-	// Update memory only if change exceeds noise threshold (0.5MB)
 	if diff := abs(sess.MemoryMB - info.MemoryMB); diff > 0.5 {
 		sess.MemoryMB = info.MemoryMB
 		changed = true
 	}
-
-	// Always store process creation time (set once, doesn't change)
 	if info.CreateTimeMs > 0 {
 		sess.ProcessCreateTimeMs = info.CreateTimeMs
 	}
-
-	// Update terminal emulator name if it changed
 	if info.Name != "" && sess.Terminal != info.Name {
 		sess.Terminal = info.Name
 		changed = true
 	}
-
-	// Resurrection: if process was marked disappeared but we found it again,
-	// revive it to active status and refresh the hook timer
 	if sess.Status == StatusDisappeared {
 		sess.Status = StatusActive
 		sess.lastHookTime = time.Now().UnixMilli()
 		changed = true
 	}
-
 	if !changed {
 		return
 	}
-
-	// Lighter persistence: only update process-related fields
-	// Uses a targeted UPDATE rather than full ON CONFLICT UPSERT
 	if sm.store != nil {
 		if err := sm.store.UpdateProcessFields(sess); err != nil {
 			log.Printf("[session] update process fields: %v", err)
 		}
 	}
-
-	// Notify WebSocket clients of process-level changes
-	// Uses a simplified changes map (only process fields that dashboard needs)
 	if sm.notify != nil {
-		changes := map[string]interface{}{
-			"pid":        sess.PID,
-			"cwd":        sess.CWD,
-			"cpu_percent": sess.CPUPercent,
-			"memory_mb":  sess.MemoryMB,
-		}
-		if info.CreateTimeMs > 0 {
-			changes["process_create_time_ms"] = info.CreateTimeMs
-		}
-		delta := &Delta{
-			SessionKey:  key,
-			Changes:     changes,
+		sm.notify("delta", &Delta{
+			SessionKey: key,
+			Changes: map[string]interface{}{
+				"pid": sess.PID, "cwd": sess.CWD,
+				"cpu_percent": sess.CPUPercent, "memory_mb": sess.MemoryMB,
+			},
 			TimestampMs: time.Now().UnixMilli(),
-		}
-		sm.notify("delta", delta)
+		})
 	}
 }
 
-// MarkDisappeared is called by PID Scanner when a known agent process
-// is no longer found in the OS process table.
-//
-// Only marks sessions that are not already in a terminal state:
-//   - Stopped:     already ended via hook event, skip (terminal state)
-//   - Disappeared: already marked, skip (idempotent)
-//   - Active/Idle: transition to Disappeared
-//
-// A disappeared session can be resurrected if the process reappears
-// in a subsequent PID scan (HandlePidUpdate will detect it and revive).
 func (sm *SessionManager) MarkDisappeared(key string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	sess, ok := sm.sessions[key]
-	if !ok {
+	if !ok || sess.Status == StatusStopped || sess.Status == StatusDisappeared {
 		return
 	}
-
-	// Don't re-mark sessions already in terminal states
-	if sess.Status == StatusStopped || sess.Status == StatusDisappeared {
-		return
-	}
-
 	sess.Status = StatusDisappeared
-
-	// Persist the status change
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] mark disappeared: %v", err)
 		}
 	}
-
-	// Notify dashboard of the status change
 	if sm.notify != nil {
-		changes := map[string]interface{}{"status": string(StatusDisappeared)}
-		delta := &Delta{
-			SessionKey:  key,
-			Changes:     changes,
+		sm.notify("delta", &Delta{
+			SessionKey: key,
+			Changes:    map[string]interface{}{"status": string(StatusDisappeared)},
 			TimestampMs: time.Now().UnixMilli(),
-		}
-		sm.notify("delta", delta)
+		})
 	}
 }
 
-// CheckIdleSessions marks active sessions as idle if no hook events have
-// been received for more than 5 minutes.
-//
-// Called by PID Scanner at the end of each scan cycle.
-// Only considers sessions with Status=Active or Status=Idle.
-// Sessions with zero lastHookTime (never received a hook event) are skipped.
-//
-// An idle session becomes active again as soon as any hook event arrives
-// (applyEvent sets Status=Active on every event).
-//
-// Note: idle marking does NOT persist to SQLite – it's a transient display
-// state that doesn't need crash recovery.
 func (sm *SessionManager) CheckIdleSessions() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	now := time.Now().UnixMilli()
-	idleThreshold := int64(5 * 60 * 1000) // 5 minutes in milliseconds
-
+	idleThreshold := int64(5 * 60 * 1000)
 	for key, sess := range sm.sessions {
 		if sess.Status != StatusActive && sess.Status != StatusIdle {
 			continue
@@ -1194,28 +649,20 @@ func (sm *SessionManager) CheckIdleSessions() {
 			if sess.Status != StatusIdle {
 				sess.Status = StatusIdle
 				if sm.notify != nil {
-					changes := map[string]interface{}{"status": string(StatusIdle)}
-					delta := &Delta{
-						SessionKey:  key,
-						Changes:     changes,
+					sm.notify("delta", &Delta{
+						SessionKey: key,
+						Changes:    map[string]interface{}{"status": string(StatusIdle)},
 						TimestampMs: now,
-					}
-					sm.notify("delta", delta)
+					})
 				}
 			}
 		}
 	}
 }
 
-// GetSessions returns a copy of all sessions for the REST API.
-//
-// Each session is shallow-copied (the struct is copied, but Payload
-// is raw JSON which is safe for concurrent reads).
-// Returns an empty slice (not nil) if no sessions exist.
 func (sm *SessionManager) GetSessions() []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	result := make([]*Session, 0, len(sm.sessions))
 	for _, s := range sm.sessions {
 		clone := *s
@@ -1224,14 +671,9 @@ func (sm *SessionManager) GetSessions() []*Session {
 	return result
 }
 
-// GetSession returns a copy of a single session by its SessionKey.
-//
-// Returns nil if the session is not found.
-// The session is shallow-copied for thread safety.
 func (sm *SessionManager) GetSession(key string) *Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	s, ok := sm.sessions[key]
 	if !ok {
 		return nil
@@ -1240,18 +682,6 @@ func (sm *SessionManager) GetSession(key string) *Session {
 	return &clone
 }
 
-// GetKnownPIDs returns all session→PID mappings for the PID Scanner.
-//
-// Called at the beginning of each PID scan cycle. The scanner uses this
-// to match discovered OS processes to their corresponding sessions.
-//
-// Returns a map of PID → SessionPIDInfo containing:
-//   - SessionKey: for session lookup during HandlePidUpdate/MarkDisappeared
-//   - PID:        the process ID to match against
-//   - AgentType:  for fallback matching when PID doesn't match directly
-//   - CWD:        for fallback matching when PID doesn't match directly
-//
-// Only sessions with PID > 0 (i.e., have been matched to a process) are included.
 func (sm *SessionManager) GetKnownPIDs() map[int]scanner.SessionPIDInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -1259,50 +689,29 @@ func (sm *SessionManager) GetKnownPIDs() map[int]scanner.SessionPIDInfo {
 	for _, sess := range sm.sessions {
 		if sess.PID > 0 {
 			result[sess.PID] = scanner.SessionPIDInfo{
-				SessionKey: sess.SessionKey,
-				PID:        sess.PID,
-				AgentType:  sess.AgentType,
-				CWD:        sess.CWD,
+				SessionKey: sess.SessionKey, PID: sess.PID,
+				AgentType: sess.AgentType, CWD: sess.CWD,
 			}
 		}
 	}
 	return result
 }
 
-// GetSnapshot returns a full copy of all sessions for new WebSocket clients.
-//
-// Called when a WebSocket client successfully authenticates. The snapshot
-// gives the client a complete initial state, after which only incremental
-// Delta messages are sent.
-//
-// Payload fields are stripped from each session copy – the raw hook payload
-// can be large and is not needed for dashboard display.
 func (sm *SessionManager) GetSnapshot() *Snapshot {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	sessions := make([]*Session, 0, len(sm.sessions))
 	for _, s := range sm.sessions {
 		clone := *s
-		clone.Payload = nil // strip raw payload for bandwidth/privacy
+		clone.Payload = nil
 		sessions = append(sessions, &clone)
 	}
-
-	return &Snapshot{
-		Sessions:  sessions,
-		GenTimeMs: time.Now().UnixMilli(),
-	}
+	return &Snapshot{Sessions: sessions, GenTimeMs: time.Now().UnixMilli()}
 }
 
-// GetSessionsForRecovery returns the internal session map for use during
-// session recovery at startup.
-//
-// Recovery uses this to check for existing sessions before creating
-// recovered ones, avoiding duplicates.
 func (sm *SessionManager) GetSessionsForRecovery() map[string]*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	result := make(map[string]*Session, len(sm.sessions))
 	for k, v := range sm.sessions {
 		result[k] = v
@@ -1310,9 +719,6 @@ func (sm *SessionManager) GetSessionsForRecovery() map[string]*Session {
 	return result
 }
 
-// HasSession checks whether a session with the given key exists.
-//
-// Used by Recovery to skip transcript sessions that are already tracked.
 func (sm *SessionManager) HasSession(key string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -1320,22 +726,14 @@ func (sm *SessionManager) HasSession(key string) bool {
 	return ok
 }
 
-// AddRecoveredSession adds a session recovered from transcript files.
-//
-// Only adds if the session doesn't already exist (idempotent).
-// Recovered sessions typically have Status=unknown until the PID Scanner
-// matches them to a running process via BindPIDToSession().
 func (sm *SessionManager) AddRecoveredSession(sess *Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	key := sess.SessionKey
 	if _, exists := sm.sessions[key]; exists {
 		return
 	}
-
 	sm.sessions[key] = sess
-
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] upsert recovered session: %v", err)
@@ -1343,26 +741,13 @@ func (sm *SessionManager) AddRecoveredSession(sess *Session) {
 	}
 }
 
-// BindPIDToSession binds a recovered session to a running OS process.
-//
-// Called during recovery after FindProcessBySession() successfully matches
-// a transcript session to a currently running agent process.
-//
-// Updates all process-level fields (PID, Terminal, CWD, CPU%, Memory) and
-// promotes the session status from Unknown to Active.
-//
-// Sets lastHookTime to current time so the session won't immediately be
-// marked idle after recovery.
 func (sm *SessionManager) BindPIDToSession(key string, info *scanner.ProcessInfo) {
-
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	sess, ok := sm.sessions[key]
 	if !ok {
 		return
 	}
-
 	sess.PID = int(info.PID)
 	sess.Terminal = info.Name
 	sess.CWD = info.CWD
@@ -1371,7 +756,6 @@ func (sm *SessionManager) BindPIDToSession(key string, info *scanner.ProcessInfo
 	sess.ProcessCreateTimeMs = info.CreateTimeMs
 	sess.Status = StatusActive
 	sess.lastHookTime = time.Now().UnixMilli()
-
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] bind pid: %v", err)
@@ -1379,19 +763,6 @@ func (sm *SessionManager) BindPIDToSession(key string, info *scanner.ProcessInfo
 	}
 }
 
-// computeDelta compares an old and new Session state, returning only the
-// fields that changed.
-//
-// This enables efficient WebSocket updates: instead of sending the full
-// session object on every change, only the modified fields are sent.
-// The dashboard client applies these changes incrementally to its local state.
-//
-// Returns nil if no fields changed (no notification is sent in that case).
-//
-// Comparison logic:
-//   - Compares old vs. new for each mutable field
-//   - Adds changed field to the changes map with its new value
-//   - JSON field names are used as map keys (matching the Session struct tags)
 func (sm *SessionManager) computeDelta(old, new *Session) *Delta {
 	changes := make(map[string]interface{})
 	if old.PID != new.PID {
@@ -1442,16 +813,10 @@ func (sm *SessionManager) computeDelta(old, new *Session) *Delta {
 	if !turnsEqual(old.Turns, new.Turns) {
 		changes["turns"] = new.Turns
 	}
-
 	if len(changes) == 0 {
 		return nil
 	}
-
-	return &Delta{
-		SessionKey:  new.SessionKey,
-		Changes:     changes,
-		TimestampMs: time.Now().UnixMilli(),
-	}
+	return &Delta{SessionKey: new.SessionKey, Changes: changes, TimestampMs: time.Now().UnixMilli()}
 }
 
 func turnsEqual(a, b []Turn) bool {
@@ -1467,7 +832,7 @@ func turnsEqual(a, b []Turn) bool {
 		}
 		for j := range a[i].Entries {
 			ea, eb := a[i].Entries[j], b[i].Entries[j]
-			if ea.Type != eb.Type || ea.Subtype != eb.Subtype || ea.Text != eb.Text || ea.TS != eb.TS || ea.StartTS != eb.StartTS || ea.Meta != eb.Meta {
+			if ea.Event != eb.Event || ea.TS != eb.TS || ea.StartTS != eb.StartTS {
 				return false
 			}
 			if len(ea.Tools) != len(eb.Tools) {
@@ -1482,6 +847,13 @@ func turnsEqual(a, b []Turn) bool {
 		}
 	}
 	return true
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func abs(x float64) float64 {

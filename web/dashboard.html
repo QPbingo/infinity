@@ -48,16 +48,16 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .tl-turn { margin-bottom: 14px; border: 1px solid #21262d; border-radius: 6px; overflow: hidden; }
 .tl-turn-header { display: flex; align-items: center; padding: 6px 10px; background: #1c2128; gap: 8px; font-size: 0.75em; color: #8b949e; border-bottom: 1px solid #21262d; }
 .tl-turn-header .tl-turn-idx { color: #58a6ff; font-weight: 600; }
+.tl-turn-body { display: none; }
+.tl-turn-body.open { display: block; }
+.tl-turn.collapsed .tl-turn-header { border-bottom: none; }
 .tl-entry { padding: 8px 12px; border-bottom: 1px solid #21262d; position: relative; }
 .tl-entry:last-child { border-bottom: none; }
 .tl-entry-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.tl-badge-a { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #1f6feb; color: white; }
-.tl-badge-b { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #9e6a03; color: white; }
-.tl-badge-permission { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #d29922; color: #0d1117; }
-.tl-badge-subagent { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #a371f7; color: white; }
-.tl-badge-compact { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #484f58; color: #c9d1d9; }
+.tl-label { font-size: 0.68em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
 .tl-error { border-left: 3px solid #f85149; background: #1a0a0a; padding: 6px 10px; font-size: 0.75em; color: #f85149; border-radius: 0 4px 4px 0; margin: 4px 0; }
 .tl-info { border-left: 2px solid #30363d; padding: 4px 10px; font-size: 0.7em; color: #8b949e; margin: 2px 0; }
+.tl-claude { border-left: 2px solid #d2a8ff; padding: 4px 10px; font-size: 0.7em; color: #c9d1d9; background: #16112a; margin: 2px 0; border-radius: 0 3px 3px 0; }
 .web-input-row { display: flex; gap: 6px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #21262d; }
 .web-input-row input { flex: 1; padding: 5px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 0.78em; }
 .web-input-row input::placeholder { color: #484f58; }
@@ -131,6 +131,7 @@ let currentFilter = 'all';
 let expandedCards = {};
 let expandedToolGroups = {};
 let expandedResults = {};
+let expandedTurns = {};
 
 document.querySelectorAll('.filter-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -197,6 +198,18 @@ function toggleResult(key, turnIdx, entryIdx) {
   if (arrow) arrow.classList.toggle('open', expandedResults[id]);
 }
 
+function toggleTurn(key, turnIdx) {
+  const id = key + '_turn_' + turnIdx;
+  expandedTurns[id] = !expandedTurns[id];
+  const body = document.querySelector('[data-turn-body="' + id + '"]');
+  if (body) {
+    body.classList.toggle('open', expandedTurns[id]);
+    body.parentElement.classList.toggle('collapsed', !expandedTurns[id]);
+  }
+  const arrow = document.querySelector('[data-turn-arrow="' + id + '"]');
+  if (arrow) arrow.classList.toggle('open', expandedTurns[id]);
+}
+
 function togglePayload(key) {
   const el = document.querySelector('[data-payload="' + key + '"]');
   if (el) el.classList.toggle('open');
@@ -220,9 +233,15 @@ function formatTime(ms) {
 function renderTimeline(turns, key) {
   if (!turns || !turns.length) return '';
   let html = '<div class="timeline">';
-  turns.forEach((turn, ti) => {
-    html += '<div class="tl-turn">';
-    html += '<div class="tl-turn-header"><span class="tl-turn-idx">Turn ' + (turn.turn_idx + 1) + '</span>';
+  [...turns].reverse().forEach((turn, ri) => { const ti = turns.length - 1 - ri;
+    const turnId = key + '_turn_' + ti;
+    const isNewest = ri === 0;
+    const isOpen = expandedTurns.hasOwnProperty(turnId) ? expandedTurns[turnId] : isNewest;
+    if (!expandedTurns.hasOwnProperty(turnId)) expandedTurns[turnId] = isOpen;
+    html += '<div class="tl-turn' + (isOpen ? '' : ' collapsed') + '">';
+    html += '<div class="tl-turn-header" onclick="event.stopPropagation();toggleTurn(\'' + key + '\',' + ti + ')" style="cursor:pointer">';
+    html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-turn-arrow="' + turnId + '">▶</span> ';
+    html += '<span class="tl-turn-idx">Turn ' + (turn.turn_idx + 1) + '</span>';
     if (turn.user_input) {
       html += '<span style="color:#8b949e">|</span><span>' + esc(trunc(turn.user_input, 40)) + '</span>';
     }
@@ -230,6 +249,7 @@ function renderTimeline(turns, key) {
       html += '<span class="tl-time">' + esc(formatTime(turn.user_ts)) + '</span>';
     }
     html += '</div>';
+    html += '<div class="tl-turn-body' + (isOpen ? ' open' : '') + '" data-turn-body="' + turnId + '">';
 
     if (turn.user_input) {
       html += '<div class="tl-entry">';
@@ -239,40 +259,18 @@ function renderTimeline(turns, key) {
     }
 
     turn.entries.forEach((entry, ei) => {
-      if (entry.type === 'A_thinking') {
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-a">A</span><span class="tl-label">Thinking</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
-        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
-        html += '</div>';
-      } else if (entry.type === 'A_result') {
-        const resId = key + '_' + ti + '_' + ei;
-        const isOpen = expandedResults[resId];
-        const text = entry.text || '';
-        const long = text.length > 200 || text.split('\n').length > 3;
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-a">A</span><span class="tl-label">Result</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
-        if (long) {
-          html += '<div class="tl-collapse-header" onclick="event.stopPropagation();toggleResult(\'' + key + '\',' + ti + ',' + ei + ')">';
-          html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + resId + '">▶</span>';
-          html += '<span style="font-size:0.7em;color:#8b949e">' + esc(text.split('\n')[0].substring(0, 80)) + (text.length > 80 || text.includes('\n') ? '...' : '') + '</span>';
-          html += '</div>';
-          html += '<div class="tl-result-body' + (isOpen ? ' open' : '') + '" data-res="' + resId + '"><div class="tl-text">' + esc(text) + '</div></div>';
-        } else {
-          html += '<div class="tl-text">' + esc(text) + '</div>';
-        }
-        html += '</div>';
-      } else if (entry.type === 'B_tool_group') {
+      const tools = entry.tools;
+      if (tools && tools.length > 0) {
         const tgId = key + '_' + ti + '_' + ei;
         const isOpen = expandedToolGroups[tgId];
-        const toolCount = entry.tools ? entry.tools.length : 0;
         html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-b">B</span><span class="tl-label">Tool Calls</span><span class="tl-tool-count">(' + toolCount + ' tools)</span><span class="tl-time">' + esc(formatTime(entry.start_ts || entry.ts)) + '</span></div>';
+        html += '<div class="tl-entry-header"><span class="tl-label">' + esc(entry.event) + '</span><span class="tl-tool-count">(' + tools.length + ' tools)</span><span class="tl-time">' + esc(formatTime(entry.start_ts || entry.ts)) + '</span></div>';
         html += '<div class="tl-tool-group-header" onclick="event.stopPropagation();toggleToolGroup(\'' + key + '\',' + ti + ',' + ei + ')">';
         html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + tgId + '">▶</span>';
-        html += '<span style="font-size:0.75em;color:#c9d1d9">' + esc((entry.tools || []).map(t => t.name).join(', ')) + '</span>';
+        html += '<span style="font-size:0.75em;color:#c9d1d9">' + esc(tools.map(t => t.name).join(', ')) + '</span>';
         html += '</div>';
         html += '<div class="tl-tools' + (isOpen ? ' open' : '') + '" data-tg="' + tgId + '">';
-        (entry.tools || []).forEach(tc => {
+        tools.forEach(tc => {
           html += '<div class="tl-tool">';
           html += '<div class="tl-tool-head"><span class="tl-tool-name">' + esc(tc.name) + '</span>';
           html += '<span class="tl-tool-status ' + esc(tc.status) + '">' + esc(tc.status) + '</span>';
@@ -282,44 +280,28 @@ function renderTimeline(turns, key) {
           html += '</div>';
         });
         html += '</div></div>';
-      } else if (entry.type === 'B_permission') {
+      } else {
+        const payload = entry.payload;
+        const text = formatPayloadDisplay(payload, entry.event);
+        const resId = key + '_' + ti + '_' + ei;
+        const isOpen = expandedResults[resId];
+        const long = text.length > 200 || text.split('\n').length > 3;
         html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-permission">B</span><span class="tl-label">Permission</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
-        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
-        html += '</div>';
-        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
-        html += '</div>';
-      } else if (entry.type === 'B_subagent') {
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-subagent">B</span><span class="tl-label">Subagent</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
-        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
-        html += '</div>';
-        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
-        html += '</div>';
-      } else if (entry.type === 'B_compact') {
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-badge-compact">B</span><span class="tl-label">Compact</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
-        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
-        html += '</div>';
-        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
-        html += '</div>';
-      } else if (entry.type === 'error') {
-        html += '<div class="tl-error">';
-        html += '<span style="font-weight:600">✕ ' + esc(entry.subtype || 'Error') + '</span>';
-        html += '<span class="tl-time" style="float:right">' + esc(formatTime(entry.ts)) + '</span>';
-        html += '<div>' + esc(entry.text) + '</div>';
-        html += '</div>';
-      } else if (entry.type === 'info') {
-        html += '<div class="tl-info">';
-        html += '<span>' + esc(entry.subtype || entry.text) + '</span>';
-        html += '<span class="tl-time" style="float:right">' + esc(formatTime(entry.ts)) + '</span>';
-        if (entry.text && entry.subtype && entry.text !== entry.subtype) {
-          html += '<div style="font-size:0.9em;color:#6e7681">' + esc(entry.text.replace(entry.subtype + ' | ', '')) + '</div>';
+        html += '<div class="tl-entry-header"><span class="tl-label">' + esc(entry.event) + '</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
+        if (long) {
+          html += '<div class="tl-collapse-header" onclick="event.stopPropagation();toggleResult(\'' + key + '\',' + ti + ',' + ei + ')">';
+          html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + resId + '">▶</span>';
+          html += '<span style="font-size:0.7em;color:#8b949e">' + esc(text.split('\n')[0].substring(0, 80)) + '...</span>';
+          html += '</div>';
+          html += '<div class="tl-result-body' + (isOpen ? ' open' : '') + '" data-res="' + resId + '"><div class="tl-text">' + esc(text) + '</div></div>';
+        } else if (text) {
+          html += '<div class="tl-text">' + esc(text) + '</div>';
         }
         html += '</div>';
       }
     });
-    html += '</div>';
+    html += '</div>'; // tl-turn-body
+    html += '</div>'; // tl-turn
   });
   html += '</div>';
   return html;
@@ -396,6 +378,30 @@ function formatPayload(p) {
   if (!p || p === 'null') return '';
   try { return JSON.stringify(typeof p === 'string' ? JSON.parse(p) : p, null, 2); }
   catch (_) { return String(p); }
+}
+
+function formatPayloadDisplay(payload, eventName) {
+  if (!payload || payload === 'null') return eventName;
+  try {
+    const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    const skip = ['hook_event_name','hookEventName','session_id','sessionId','daemon_token','turn_id','cwd','permission_mode'];
+    const parts = [];
+    for (const [k, v] of Object.entries(data)) {
+      if (skip.includes(k)) continue;
+      if (typeof v === 'string') parts.push(k + ': ' + v);
+      else if (typeof v === 'object' && v !== null) {
+        const inner = [];
+        for (const [ik, iv] of Object.entries(v)) {
+          if (typeof iv === 'string') inner.push(ik + ': ' + iv);
+        }
+        if (inner.length) parts.push(k + ' { ' + inner.join(', ') + ' }');
+        else parts.push(k + ': ' + JSON.stringify(v));
+      } else if (v !== undefined && v !== null) {
+        parts.push(k + ': ' + v);
+      }
+    }
+    return parts.join('\n') || eventName;
+  } catch (_) { return eventName; }
 }
 
 if (savedToken) connect();

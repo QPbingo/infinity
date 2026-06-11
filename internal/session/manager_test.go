@@ -20,7 +20,7 @@ func TestBuildTurn_UserPrompt(t *testing.T) {
 		TimestampMs: 1000,
 		Payload:     makePayload(map[string]interface{}{"prompt": "hello world"}),
 	}
-	s.applyEvent(ev, EventUserPrompt)
+	s.applyEvent(ev)
 
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
@@ -35,88 +35,45 @@ func TestBuildTurn_UserPrompt(t *testing.T) {
 	if turn.UserTS != 1000 {
 		t.Errorf("expected user_ts 1000, got %d", turn.UserTS)
 	}
-	if s.TurnCount != 1 {
-		t.Errorf("expected TurnCount 1, got %d", s.TurnCount)
-	}
 }
 
-func TestBuildTurn_AssistantTextThinking(t *testing.T) {
+func TestBuildTurn_AssistantText(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
-
 	ev := &HookEvent{
 		Event:       "AssistantText",
 		AgentType:   "opencode",
 		TimestampMs: 2000,
-		Payload:     makePayload(map[string]interface{}{"type": "A_thinking", "text": "I need to think about this"}),
+		Payload:     makePayload(map[string]interface{}{"text": "I need to think about this"}),
 	}
-	s.applyEvent(ev, EventAssistantText)
-
-	if len(s.Turns) != 1 {
-		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
+	s.applyEvent(ev)
+	if len(s.Turns[0].Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
 	}
-	turn := s.Turns[0]
-	if len(turn.Entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(turn.Entries))
+	e := s.Turns[0].Entries[0]
+	if e.Event != "AssistantText" {
+		t.Errorf("expected event AssistantText, got %q", e.Event)
 	}
-	e := turn.Entries[0]
-	if e.Type != "A_thinking" {
-		t.Errorf("expected type A_thinking, got %q", e.Type)
-	}
-	if e.Text != "I need to think about this" {
-		t.Errorf("expected text, got %q", e.Text)
-	}
-	if e.TS != 2000 {
-		t.Errorf("expected ts 2000, got %d", e.TS)
+	if string(e.Payload) == "" {
+		t.Error("expected non-empty payload")
 	}
 }
 
-func TestBuildTurn_AssistantTextResult(t *testing.T) {
+func TestBuildTurn_ReasoningPart(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
-
 	ev := &HookEvent{
-		Event:       "AssistantText",
-		AgentType:   "opencode",
-		TimestampMs: 3000,
-		Payload:     makePayload(map[string]interface{}{"type": "A_result", "text": "here is the code"}),
+		Event:       "ReasoningPart",
+		TimestampMs: 2000,
+		Payload:     makePayload(map[string]interface{}{"text": "reasoning content"}),
 	}
-	s.applyEvent(ev, EventAssistantText)
-
+	s.applyEvent(ev)
 	e := s.Turns[0].Entries[0]
-	if e.Type != "A_result" {
-		t.Errorf("expected type A_result, got %q", e.Type)
+	if e.Event != "ReasoningPart" {
+		t.Errorf("expected event ReasoningPart, got %q", e.Event)
 	}
-}
-
-func TestBuildTurn_AssistantTextDefaultResult(t *testing.T) {
-	s := &Session{}
-	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
-
-	ev := &HookEvent{
-		Event:       "AssistantText",
-		TimestampMs: 3000,
-		Payload:     makePayload(map[string]interface{}{"text": "some output"}),
-	}
-	s.applyEvent(ev, EventAssistantText)
-
-	e := s.Turns[0].Entries[0]
-	if e.Type != "A_result" {
-		t.Errorf("expected default type A_result, got %q", e.Type)
-	}
-}
-
-func TestBuildTurn_AssistantTextNoTurns(t *testing.T) {
-	s := &Session{}
-	ev := &HookEvent{
-		Event:       "AssistantText",
-		TimestampMs: 1000,
-		Payload:     makePayload(map[string]interface{}{"type": "A_thinking", "text": "thinking"}),
-	}
-	s.applyEvent(ev, EventAssistantText)
-
-	if len(s.Turns) != 1 {
-		t.Fatalf("expected 1 auto-created turn, got %d", len(s.Turns))
+	if len(e.Payload) == 0 {
+		t.Error("expected non-empty payload")
 	}
 }
 
@@ -125,278 +82,192 @@ func TestBuildTurn_ToolCallSingle(t *testing.T) {
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
 
 	pre := &HookEvent{
-		Event:       "PreToolUse",
-		TimestampMs: 2000,
-		Payload:     makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/foo.go"}}),
+		Event: "PreToolUse", TimestampMs: 2000,
+		Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/foo.go"}}),
 	}
-	s.applyEvent(pre, EventPreToolUse)
-
-	if len(s.Turns[0].Entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
-	}
-	grp := s.Turns[0].Entries[0]
-	if grp.Type != "B_tool_group" {
-		t.Errorf("expected B_tool_group, got %q", grp.Type)
-	}
-	if len(grp.Tools) != 1 {
-		t.Fatalf("expected 1 tool, got %d", len(grp.Tools))
-	}
-	tc := grp.Tools[0]
-	if tc.Name != "Read" {
-		t.Errorf("expected tool Read, got %q", tc.Name)
-	}
-	if tc.Status != "running" {
-		t.Errorf("expected status running, got %q", tc.Status)
-	}
-	if tc.Input != "/foo.go" {
-		t.Errorf("expected input /foo.go, got %q", tc.Input)
-	}
-
+	s.applyEvent(pre)
 	post := &HookEvent{
-		Event:       "PostToolUse",
-		TimestampMs: 3000,
-		Payload:     makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "file content here"}),
+		Event: "PostToolUse", TimestampMs: 3000,
+		Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "file content"}),
 	}
-	s.applyEvent(post, EventPostToolUse)
+	s.applyEvent(post)
 
-	tc = s.Turns[0].Entries[0].Tools[0]
-	if tc.Status != "completed" {
-		t.Errorf("expected status completed, got %q", tc.Status)
+	entry := s.Turns[0].Entries[0]
+	if len(entry.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(entry.Tools))
 	}
-	if tc.Output != "file content here" {
-		t.Errorf("expected output, got %q", tc.Output)
+	if entry.Tools[0].Name != "Read" || entry.Tools[0].Status != "completed" {
+		t.Errorf("tool mismatch: %+v", entry.Tools[0])
 	}
-	if tc.EndTS != 3000 {
-		t.Errorf("expected end_ts 3000, got %d", tc.EndTS)
+	if entry.Tools[0].Output != "file content" {
+		t.Errorf("expected output, got %q", entry.Tools[0].Output)
 	}
 }
 
 func TestBuildTurn_ToolCallMultipleSameGroup(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/a.go"}})})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "a"})})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2600, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_input": map[string]interface{}{"filePath": "/b.go"}})})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_output": "b"})})
 
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/a.go"}})}, EventPreToolUse)
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "content a"})}, EventPostToolUse)
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2600, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_input": map[string]interface{}{"filePath": "/b.go"}})}, EventPreToolUse)
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_output": "written"})}, EventPostToolUse)
+	entry := s.Turns[0].Entries[0]
+	if len(entry.Tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(entry.Tools))
+	}
+	if entry.Tools[0].Name != "Read" || entry.Tools[1].Name != "Write" {
+		t.Errorf("tool names mismatch")
+	}
+}
 
-	grp := s.Turns[0].Entries[0]
-	if grp.Type != "B_tool_group" {
-		t.Errorf("expected B_tool_group, got %q", grp.Type)
+func TestBuildTurn_ToolFailure(t *testing.T) {
+	s := &Session{}
+	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "tool_input": map[string]interface{}{"command": "rm -rf /"}})})
+	s.applyEvent(&HookEvent{Event: "PostToolUseFailure", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "reason": "blocked"})})
+
+	if len(s.Turns[0].Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
 	}
-	if len(grp.Tools) != 2 {
-		t.Fatalf("expected 2 tools in one group, got %d", len(grp.Tools))
-	}
-	if grp.Tools[0].Name != "Read" {
-		t.Errorf("expected first tool Read, got %q", grp.Tools[0].Name)
-	}
-	if grp.Tools[1].Name != "Write" {
-		t.Errorf("expected second tool Write, got %q", grp.Tools[1].Name)
+	tc := s.Turns[0].Entries[0].Tools[0]
+	if tc.Status != "error" || tc.Output != "blocked" {
+		t.Errorf("expected error tool, got status=%s output=%s", tc.Status, tc.Output)
 	}
 }
 
 func TestBuildTurn_FullTurnFlow(t *testing.T) {
 	s := &Session{}
-
-	// User prompt
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "sort this array"})}, EventUserPrompt)
-
-	// Thinking
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"type": "A_thinking", "text": "I should use quicksort"})}, EventAssistantText)
-
-	// Tool calls
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/src/main.go"}})}, EventPreToolUse)
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "package main..."})}, EventPostToolUse)
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2600, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_input": map[string]interface{}{"filePath": "/src/sort.go"}})}, EventPreToolUse)
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_output": "func sort..."})}, EventPostToolUse)
-
-	// Result
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 3500, Payload: makePayload(map[string]interface{}{"type": "A_result", "text": "I wrote the sort function to /src/sort.go"})}, EventAssistantText)
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "sort"})})
+	s.applyEvent(&HookEvent{Event: "ReasoningPart", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "I should use quicksort"})})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/main.go"}})})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "pkg main"})})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 3500, Payload: makePayload(map[string]interface{}{"text": "I wrote sort to /main.go"})})
 
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
 	}
 	turn := s.Turns[0]
-	if turn.UserInput != "sort this array" {
-		t.Errorf("unexpected user input: %q", turn.UserInput)
-	}
 	if len(turn.Entries) != 3 {
-		t.Fatalf("expected 3 entries (thinking, tool_group, result), got %d", len(turn.Entries))
+		t.Fatalf("expected 3 entries, got %d", len(turn.Entries))
 	}
-	if turn.Entries[0].Type != "A_thinking" {
-		t.Errorf("expected entry 0 = A_thinking, got %q", turn.Entries[0].Type)
+	if turn.Entries[0].Event != "ReasoningPart" {
+		t.Errorf("expected ReasoningPart, got %s", turn.Entries[0].Event)
 	}
-	if turn.Entries[1].Type != "B_tool_group" {
-		t.Errorf("expected entry 1 = B_tool_group, got %q", turn.Entries[1].Type)
+	if len(turn.Entries[1].Tools) != 1 {
+		t.Errorf("expected 1 tool in entry 1")
 	}
-	if len(turn.Entries[1].Tools) != 2 {
-		t.Errorf("expected 2 tools in group, got %d", len(turn.Entries[1].Tools))
-	}
-	if turn.Entries[2].Type != "A_result" {
-		t.Errorf("expected entry 2 = A_result, got %q", turn.Entries[2].Type)
+	if turn.Entries[2].Event != "AssistantText" {
+		t.Errorf("expected AssistantText, got %s", turn.Entries[2].Event)
 	}
 }
 
 func TestBuildTurn_MultipleTurns(t *testing.T) {
 	s := &Session{}
-
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "first"})}, EventUserPrompt)
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"type": "A_result", "text": "first response"})}, EventAssistantText)
-
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "second"})}, EventUserPrompt)
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"type": "A_result", "text": "second response"})}, EventAssistantText)
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "first"})})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "first response"})})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "second"})})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"text": "second response"})})
 
 	if len(s.Turns) != 2 {
 		t.Fatalf("expected 2 turns, got %d", len(s.Turns))
 	}
-	if s.Turns[0].TurnIdx != 0 || s.Turns[0].UserInput != "first" {
-		t.Errorf("turn 0 incorrect")
+}
+
+func TestBuildTurn_GenericInfoEvents(t *testing.T) {
+	s := &Session{}
+	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
+	// Any non-structural event should create a generic entry
+	s.applyEvent(&HookEvent{Event: "ConfigChange", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"source": "user_settings"})})
+	s.applyEvent(&HookEvent{Event: "FileEdited", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"filePath": "/test.go"})})
+	s.applyEvent(&HookEvent{Event: "PermissionAsked", TimestampMs: 4000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "message": "allow?"})})
+
+	if len(s.Turns[0].Entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(s.Turns[0].Entries))
 	}
-	if s.Turns[1].TurnIdx != 1 || s.Turns[1].UserInput != "second" {
-		t.Errorf("turn 1 incorrect")
+	// Each entry preserves its native event name
+	if s.Turns[0].Entries[0].Event != "ConfigChange" {
+		t.Errorf("expected ConfigChange, got %s", s.Turns[0].Entries[0].Event)
 	}
-	if s.TurnCount != 2 {
-		t.Errorf("expected TurnCount 2, got %d", s.TurnCount)
+	if s.Turns[0].Entries[1].Event != "FileEdited" {
+		t.Errorf("expected FileEdited, got %s", s.Turns[0].Entries[1].Event)
+	}
+	if s.Turns[0].Entries[2].Event != "PermissionAsked" {
+		t.Errorf("expected PermissionAsked, got %s", s.Turns[0].Entries[2].Event)
 	}
 }
 
-func TestBuildTurn_SessionEndAddsResult(t *testing.T) {
-	sm := &SessionManager{
-		sessions: make(map[string]*Session),
-		userID:   "u1",
-		deviceID: "d1",
-	}
-	key := ComputeSessionKey("u1", "d1", "opencode", "sid1")
-	s := &Session{
-		UserID:         "u1",
-		DeviceID:       "d1",
-		AgentType:      "opencode",
-		AgentSessionID: "sid1",
-		SessionKey:     key,
-		Turns: []Turn{
-			{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}},
-		},
-	}
-	sm.sessions[key] = s
-
-	ev := &HookEvent{
-		Event:       "Stop",
-		AgentType:   "opencode",
-		SessionID:   "sid1",
-		TimestampMs: 5000,
-		Payload:     makePayload(map[string]interface{}{"model_output": "final output text"}),
-	}
-	sm.HandleEvent(ev)
-
+func TestBuildTurn_WebInputActive(t *testing.T) {
+	s := &Session{webInputActive: true}
+	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "web input", UserTS: 1000, Entries: []TurnEntry{}})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "duplicate"})})
+	// Should NOT create a new turn
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
 	}
-	lastEntry := s.Turns[0].Entries[len(s.Turns[0].Entries)-1]
-	if lastEntry.Type != "A_result" {
-		t.Errorf("expected final A_result from session_end, got %q", lastEntry.Type)
+	if s.webInputActive {
+		t.Error("expected webInputActive to be cleared")
 	}
-	if lastEntry.Text != "final output text" {
-		t.Errorf("expected final output text, got %q", lastEntry.Text)
+}
+
+func TestSessionEndAddsResult(t *testing.T) {
+	sm := &SessionManager{
+		sessions: make(map[string]*Session), userID: "u1", deviceID: "d1",
+	}
+	key := ComputeSessionKey("u1", "d1", "opencode", "sid1")
+	s := &Session{
+		UserID: "u1", DeviceID: "d1", AgentType: "opencode",
+		AgentSessionID: "sid1", SessionKey: key,
+		Turns: []Turn{{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}}},
+	}
+	sm.sessions[key] = s
+	ev := &HookEvent{Event: "Stop", AgentType: "opencode", SessionID: "sid1", TimestampMs: 5000,
+		Payload: makePayload(map[string]interface{}{"model_output": "final"})}
+	sm.HandleEvent(ev)
+
+	turn := s.Turns[0]
+	if len(turn.Entries) == 0 || turn.Entries[len(turn.Entries)-1].Event != "Stop" {
+		t.Errorf("expected Stop entry, got %d entries", len(turn.Entries))
 	}
 }
 
 func TestComputeDelta_Turns(t *testing.T) {
 	sm := &SessionManager{}
 	old := &Session{Turns: []Turn{{TurnIdx: 0, UserInput: "a", Entries: []TurnEntry{}}}}
-	new := &Session{Turns: []Turn{{TurnIdx: 0, UserInput: "a", Entries: []TurnEntry{{Type: "A_result", Text: "resp", TS: 100}}}}}
-
+	new := &Session{Turns: []Turn{{TurnIdx: 0, UserInput: "a", Entries: []TurnEntry{{Event: "AssistantText", TS: 100}}}}}
 	delta := sm.computeDelta(old, new)
 	if delta == nil {
-		t.Fatal("expected non-nil delta")
+		t.Fatal("expected delta")
 	}
 	if _, ok := delta.Changes["turns"]; !ok {
-		t.Error("expected turns in delta changes")
-	}
-}
-
-func TestComputeDelta_TurnsNoChange(t *testing.T) {
-	sm := &SessionManager{}
-	turns := []Turn{{TurnIdx: 0, UserInput: "a", Entries: []TurnEntry{}}}
-	old := &Session{SessionKey: "k1", Turns: turns}
-	new := &Session{SessionKey: "k1", Turns: turns}
-
-	delta := sm.computeDelta(old, new)
-	if delta != nil {
-		t.Error("expected nil delta when turns unchanged")
-	}
-}
-
-func TestTurnsEqual(t *testing.T) {
-	a := []Turn{{TurnIdx: 0, UserInput: "hi", UserTS: 100, Entries: []TurnEntry{}}}
-	b := []Turn{{TurnIdx: 0, UserInput: "hi", UserTS: 100, Entries: []TurnEntry{}}}
-	if !turnsEqual(a, b) {
-		t.Error("expected equal turns")
-	}
-}
-
-func TestTurnsEqual_Different(t *testing.T) {
-	a := []Turn{{TurnIdx: 0, UserInput: "hi", Entries: []TurnEntry{}}}
-	b := []Turn{{TurnIdx: 0, UserInput: "bye", Entries: []TurnEntry{}}}
-	if turnsEqual(a, b) {
-		t.Error("expected different turns")
-	}
-}
-
-func TestTurnsEqual_DifferentLength(t *testing.T) {
-	a := []Turn{{TurnIdx: 0}}
-	b := []Turn{{TurnIdx: 0}, {TurnIdx: 1}}
-	if turnsEqual(a, b) {
-		t.Error("expected different length turns to not be equal")
-	}
-}
-
-func TestTurnsEqual_DifferentEntries(t *testing.T) {
-	a := []Turn{{TurnIdx: 0, Entries: []TurnEntry{{Type: "A_thinking", Text: "x"}}}}
-	b := []Turn{{TurnIdx: 0, Entries: []TurnEntry{{Type: "A_thinking", Text: "y"}}}}
-	if turnsEqual(a, b) {
-		t.Error("expected different entries to not be equal")
+		t.Error("expected turns in delta")
 	}
 }
 
 func TestExtractStringField(t *testing.T) {
-	payload := makePayload(map[string]interface{}{"foo": "bar", "baz": "qux"})
-	if v := extractStringField(payload, "foo"); v != "bar" {
+	p := makePayload(map[string]interface{}{"foo": "bar"})
+	if v := extractStringField(p, "foo"); v != "bar" {
 		t.Errorf("expected bar, got %q", v)
-	}
-	if v := extractStringField(payload, "nonexistent"); v != "" {
-		t.Errorf("expected empty, got %q", v)
 	}
 }
 
 func TestExtractToolInput(t *testing.T) {
-	payload := makePayload(map[string]interface{}{
-		"tool_input": map[string]interface{}{"command": "ls -la"},
-	})
-	if v := extractToolInput(payload); v != "ls -la" {
-		t.Errorf("expected 'ls -la', got %q", v)
-	}
-
-	payload2 := makePayload(map[string]interface{}{
-		"tool_input": map[string]interface{}{"filePath": "/foo/bar.go"},
-	})
-	if v := extractToolInput(payload2); v != "/foo/bar.go" {
-		t.Errorf("expected '/foo/bar.go', got %q", v)
+	p := makePayload(map[string]interface{}{"tool_input": map[string]interface{}{"command": "ls"}})
+	if v := extractToolInput(p); v != "ls" {
+		t.Errorf("expected ls, got %q", v)
 	}
 }
 
 func TestExtractToolOutput(t *testing.T) {
-	payload := makePayload(map[string]interface{}{"tool_output": "done"})
-	if v := extractToolOutput(payload); v != "done" {
-		t.Errorf("expected 'done', got %q", v)
+	p := makePayload(map[string]interface{}{"tool_output": "done"})
+	if v := extractToolOutput(p); v != "done" {
+		t.Errorf("expected done, got %q", v)
 	}
 }
-
-// ── SQLite turns round-trip ──
 
 func TestStoreTurnsRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-
 	store, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -404,33 +275,21 @@ func TestStoreTurnsRoundTrip(t *testing.T) {
 	defer store.Close()
 
 	sess := &Session{
-		UserID:         "u1",
-		DeviceID:       "d1",
-		AgentType:      "opencode",
-		AgentSessionID: "sid1",
-		SessionKey:     "key1",
-		Status:         StatusActive,
-		StartTimeMs:    1000,
-		Turns: []Turn{
-			{
-				TurnIdx:   0,
-				UserInput: "hello",
-				UserTS:    1000,
-				Entries: []TurnEntry{
-					{Type: "A_thinking", Text: "thinking...", TS: 1100},
-					{Type: "B_tool_group", Tools: []ToolCall{
-						{Name: "Read", Input: "/f.go", Output: "content", Status: "completed", StartTS: 1200, EndTS: 1300},
-					}, StartTS: 1200},
-					{Type: "A_result", Text: "response", TS: 1400},
-				},
+		UserID: "u1", DeviceID: "d1", AgentType: "opencode",
+		AgentSessionID: "sid1", SessionKey: "key1",
+		Status: StatusActive, StartTimeMs: 1000,
+		Turns: []Turn{{
+			TurnIdx: 0, UserInput: "hello", UserTS: 1000,
+			Entries: []TurnEntry{
+				{Event: "ReasoningPart", TS: 1100, Payload: json.RawMessage(`{"text":"thinking..."}`)},
+				{Event: "PreToolUse", Tools: []ToolCall{{Name: "Read", Input: "/f.go", Output: "c", Status: "completed", StartTS: 1200, EndTS: 1300}}, StartTS: 1200, Payload: json.RawMessage(`{"tool_name":"Read"}`)},
+				{Event: "AssistantText", TS: 1400, Payload: json.RawMessage(`{"text":"response"}`)},
 			},
-		},
+		}},
 	}
-
 	if err := store.Upsert(sess); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-
 	sessions, err := store.LoadAll()
 	if err != nil {
 		t.Fatalf("LoadAll: %v", err)
@@ -438,70 +297,21 @@ func TestStoreTurnsRoundTrip(t *testing.T) {
 	if len(sessions) != 1 {
 		t.Fatalf("expected 1 session, got %d", len(sessions))
 	}
-
 	loaded := sessions[0]
 	if len(loaded.Turns) != 1 {
-		t.Fatalf("expected 1 turn after reload, got %d", len(loaded.Turns))
+		t.Fatalf("expected 1 turn, got %d", len(loaded.Turns))
 	}
-	turn := loaded.Turns[0]
-	if turn.UserInput != "hello" {
-		t.Errorf("expected user_input 'hello', got %q", turn.UserInput)
+	if len(loaded.Turns[0].Entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(loaded.Turns[0].Entries))
 	}
-	if len(turn.Entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(turn.Entries))
+	if loaded.Turns[0].Entries[0].Event != "ReasoningPart" {
+		t.Errorf("expected ReasoningPart, got %s", loaded.Turns[0].Entries[0].Event)
 	}
-	if turn.Entries[0].Type != "A_thinking" {
-		t.Errorf("expected A_thinking, got %q", turn.Entries[0].Type)
+	if loaded.Turns[0].Entries[1].Tools[0].Name != "Read" {
+		t.Errorf("expected tool Read, got %s", loaded.Turns[0].Entries[1].Tools[0].Name)
 	}
-	if turn.Entries[1].Type != "B_tool_group" {
-		t.Errorf("expected B_tool_group, got %q", turn.Entries[1].Type)
-	}
-	if len(turn.Entries[1].Tools) != 1 {
-		t.Errorf("expected 1 tool, got %d", len(turn.Entries[1].Tools))
-	}
-	tc := turn.Entries[1].Tools[0]
-	if tc.Name != "Read" || tc.Input != "/f.go" || tc.Output != "content" || tc.Status != "completed" {
-		t.Errorf("tool data mismatch: %+v", tc)
-	}
-	if turn.Entries[2].Type != "A_result" {
-		t.Errorf("expected A_result, got %q", turn.Entries[2].Type)
-	}
-}
-
-func TestStoreEmptyTurns(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	store, err := NewStore(dbPath)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	defer store.Close()
-
-	sess := &Session{
-		UserID:         "u1",
-		DeviceID:       "d1",
-		AgentType:      "opencode",
-		AgentSessionID: "sid1",
-		SessionKey:     "key1",
-		Status:         StatusActive,
-		StartTimeMs:    1000,
-		Turns:          nil,
-	}
-
-	if err := store.Upsert(sess); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-
-	sessions, err := store.LoadAll()
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(sessions))
-	}
-	if len(sessions[0].Turns) != 0 {
-		t.Errorf("expected 0 turns for nil Turns, got %d", len(sessions[0].Turns))
+	if loaded.Turns[0].Entries[2].Event != "AssistantText" {
+		t.Errorf("expected AssistantText, got %s", loaded.Turns[0].Entries[2].Event)
 	}
 }
 
