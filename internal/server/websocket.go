@@ -326,10 +326,7 @@ func (c *WSClient) readPump() {
 	}
 	c.sendJSON(snapMsg)
 
-	// ── Read loop – only handle ping messages ──────────────────────────
-	// The dashboard client can send "ping" to check connection health.
-	// The server responds with "pong". Server-initiated pings are handled
-	// by writePump (WebSocket Ping frames, not JSON messages).
+	// ── Read loop – handle ping and send_input messages ─────────────────
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
@@ -339,8 +336,16 @@ func (c *WSClient) readPump() {
 		if err := json.Unmarshal(message, &msg); err != nil {
 			continue
 		}
-		if msgType, _ := msg["type"].(string); msgType == "ping" {
+		msgType, _ := msg["type"].(string)
+		switch msgType {
+		case "ping":
 			c.sendJSON(map[string]string{"type": "pong"})
+		case "send_input":
+			key, _ := msg["session_key"].(string)
+			text, _ := msg["text"].(string)
+			if key != "" && text != "" {
+				c.hub.sessions.HandleWebInput(key, text)
+			}
 		}
 	}
 }

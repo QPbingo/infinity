@@ -15,8 +15,11 @@ const opencodeManifestFile = "agent-monitor-opencode-plugin.json"
 
 const opencodePluginCode = `// Agent Monitor — OpenCode Plugin
 import { spawnSync } from "child_process";
+import { readFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
-export const AgentMonitorPlugin = async ({ directory }) => {
+export const AgentMonitorPlugin = async ({ client, directory }) => {
   const HOOK_BIN = "__HOOK_BIN_PATH__";
   const msgRoles = new Map();
   const startedSessions = new Set();
@@ -38,9 +41,44 @@ export const AgentMonitorPlugin = async ({ directory }) => {
     }
   }
 
-  function sid(p) {
-    return p?.sessionID || p?.id || (p?.info && (p.info.sessionID || p.info.id)) || "";
+  function readToken() {
+    try {
+      return readFileSync(join(homedir(), ".agent-monitor", "local-token"), "utf8").trim();
+    } catch { return ""; }
   }
+
+  // ── Poll daemon for web inputs ──
+  let polling = false;
+  async function pollInputs() {
+    if (polling) return;
+    const token = readToken();
+    if (!token) return;
+    polling = true;
+    try {
+      for (const sid of startedSessions) {
+        const url = "http://127.0.0.1:9101/api/poll-input?agent_type=opencode&agent_session_id=" + encodeURIComponent(sid);
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 3000);
+        let res;
+        try {
+          res = await fetch(url, { headers: { "X-Daemon-Token": token }, signal: ctrl.signal });
+        } catch { clearTimeout(t); continue; }
+        clearTimeout(t);
+        if (res.status === 200) {
+          const data = await res.json();
+          if (data.text) {
+            client.session.prompt({
+              path: { id: sid },
+              body: { parts: [{ type: "text", text: data.text }] }
+            });
+          }
+        }
+      }
+    } catch {}
+    polling = false;
+  }
+  setInterval(pollInputs, 1000);
+  pollInputs();
 
   return {
     "event": async ({ event: ev }) => {
@@ -120,10 +158,20 @@ export const AgentMonitorPlugin = async ({ directory }) => {
 
         if (part.type === "text" && part.messageID) {
           const meta = msgRoles.get(part.messageID);
-          if (!meta) return;
           const text = part.text || "";
+          if (!meta) {
+            // Race: message.part.updated fired before message.updated.
+            // Fall back to part/payload session detection.
+            const fallbackSid = part.sessionID || p?.sessionID || "";
+            if (fallbackSid && startedSessions.has(fallbackSid) && text) {
+              send({ event: "AssistantText", session_id: fallbackSid, type: "A_result", text });
+            }
+            return;
+          }
           if (meta.role === "user" && text) {
             ensureStarted(meta.sessionID);
+            // Web-injected prompts already send UserPromptSubmit via manual send(),
+            // but terminal-typed prompts need this path.
             send({ event: "UserPromptSubmit", session_id: meta.sessionID, prompt: text });
           } else if (meta.role === "assistant" && text) {
             ensureStarted(meta.sessionID);

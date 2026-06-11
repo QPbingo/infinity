@@ -37,7 +37,7 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .card-body.open { display: block; }
 .block { margin-bottom: 10px; }
 .block-label { font-size: 0.68em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
-.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px 16px; font-size: 0.78em; }
+.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; gap: 6px 10px; font-size: 0.78em; }
 .info-item { display: flex; gap: 4px; }
 .info-key { color: #8b949e; }
 .info-val { color: #c9d1d9; font-family: 'SF Mono', monospace; font-size: 0.9em; }
@@ -58,6 +58,11 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .tl-badge-compact { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #484f58; color: #c9d1d9; }
 .tl-error { border-left: 3px solid #f85149; background: #1a0a0a; padding: 6px 10px; font-size: 0.75em; color: #f85149; border-radius: 0 4px 4px 0; margin: 4px 0; }
 .tl-info { border-left: 2px solid #30363d; padding: 4px 10px; font-size: 0.7em; color: #8b949e; margin: 2px 0; }
+.web-input-row { display: flex; gap: 6px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #21262d; }
+.web-input-row input { flex: 1; padding: 5px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 0.78em; }
+.web-input-row input::placeholder { color: #484f58; }
+.web-input-row button { padding: 4px 10px; background: #1f6feb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75em; white-space: nowrap; }
+.web-input-row button:hover { background: #388bfd; }
 .tl-label { font-size: 0.7em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
 .tl-time { font-size: 0.65em; color: #484f58; margin-left: auto; font-family: 'SF Mono', monospace; }
 .tl-text { font-size: 0.8em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #c9d1d9; }
@@ -195,6 +200,15 @@ function toggleResult(key, turnIdx, entryIdx) {
 function togglePayload(key) {
   const el = document.querySelector('[data-payload="' + key + '"]');
   if (el) el.classList.toggle('open');
+}
+
+function sendInput(key) {
+  const input = document.getElementById('input-' + key);
+  if (!input || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const text = input.value.trim();
+  if (!text) return;
+  ws.send(JSON.stringify({ type: 'send_input', session_key: key, text: text }));
+  input.value = '';
 }
 
 function formatTime(ms) {
@@ -355,15 +369,21 @@ function render() {
       + (s.session_title ? '<div class="block"><div class="block-label">Title</div><div style="font-size:0.9em;color:#e6edf3;">' + esc(s.session_title) + '</div></div>' : '')
 
       + '<div class="info-grid">'
+      + '<div class="info-item"><span class="info-key">Session</span><span class="info-val" title="' + esc(s.agent_session_id || '') + '">' + esc(trunc(s.agent_session_id, 12)) + '</span></div>'
       + '<div class="info-item"><span class="info-key">PID</span><span class="info-val">' + (s.pid||'-') + '</span></div>'
       + '<div class="info-item"><span class="info-key">Terminal</span><span class="info-val">' + esc(terminal) + '</span></div>'
-      + '<div class="info-item"><span class="info-key">CWD</span><span class="info-val">' + esc(s.cwd) + '</span></div>'
+      + '<div class="info-item"><span class="info-key">CWD</span><span class="info-val">' + esc(trunc(s.cwd, 30)) + '</span></div>'
       + '<div class="info-item"><span class="info-key">Turns</span><span class="info-val">' + (s.turn_count||0) + '</span></div>'
       + '</div>'
 
       + (hasTurns ? renderTimeline(s.turns, key) : renderLegacy(s))
 
       + (hasPayload ? '<div class="payload-section"><div class="payload-header" onclick="event.stopPropagation();togglePayload(\'' + key + '\')">▶ Raw Payload</div><div class="payload-body" data-payload="' + key + '"><pre>' + esc(formatPayload(s.payload)) + '</pre></div></div>' : '')
+
+      + '<div class="web-input-row" onclick="event.stopPropagation()">'
+      + '<input type="text" id="input-' + key + '" placeholder="Send prompt to agent..." onkeydown="if(event.key===\'Enter\')sendInput(\'' + key + '\')">'
+      + '<button onclick="sendInput(\'' + key + '\')">Send</button>'
+      + '</div>'
 
       + '</div></div>';
   }).join('');

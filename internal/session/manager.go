@@ -35,12 +35,13 @@ type NotifyFunc func(eventType string, data interface{})
 // Hub without creating a circular dependency.
 type SessionManager struct {
 	mu       sync.RWMutex
-	sessions map[string]*Session // map[SessionKey]*Session, the in-memory store
-	store    *Store              // SQLite persistence layer (nil if not available)
-	notify   NotifyFunc          // Callback for real-time updates (wired to WebSocket Hub)
+	sessions map[string]*Session
+	store    *Store
+	notify   NotifyFunc
 
-	userID   string // User identifier (--user-id flag)
-	deviceID string // Device identifier (UUID v4 from device-id file)
+	userID        string
+	deviceID      string
+	pendingInputs map[string]string // sessionKey → prompt text, polled by OpenCode plugin
 }
 
 // NewSessionManager creates a new session manager with the given store and identity.
@@ -49,10 +50,11 @@ type SessionManager struct {
 // then call SetNotify() to wire up the notification callback.
 func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	return &SessionManager{
-		sessions: make(map[string]*Session),
-		store:    store,
-		userID:   userID,
-		deviceID: deviceID,
+		sessions:      make(map[string]*Session),
+		store:         store,
+		userID:        userID,
+		deviceID:      deviceID,
+		pendingInputs: make(map[string]string),
 	}
 }
 
@@ -69,6 +71,9 @@ func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 func (sm *SessionManager) SetNotify(fn NotifyFunc) {
 	sm.notify = fn
 }
+
+func (sm *SessionManager) UserID() string  { return sm.userID }
+func (sm *SessionManager) DeviceID() string { return sm.deviceID }
 
 // LoadFromStore restores all sessions from SQLite into the in-memory map.
 //
@@ -325,8 +330,16 @@ func (s *Session) applyEvent(event *HookEvent, eventType EventType) {
 //   PostToolUse → completes tool in B_tool_group entry
 //   Notification(type=result) → adds A_result entry
 func (s *Session) buildTurnEntry(event *HookEvent, eventType EventType) {
+	// If web input created this turn, clear the flag when any model event arrives
+	if s.webInputActive && eventType != EventUserPrompt && eventType != EventSessionStart {
+		s.webInputActive = false
+	}
+
 	switch eventType {
 	case EventUserPrompt:
+		if s.webInputActive {
+			return // skip duplicate turn from plugin-injected prompt
+		}
 		input := extractStringField(event.Payload, "prompt", "user_input", "text", "message")
 		s.Turns = append(s.Turns, Turn{
 			TurnIdx:   len(s.Turns),
@@ -940,6 +953,66 @@ func (s *Session) extractToolInfo(payload json.RawMessage) {
 	} else if file, ok := data["file"].(string); ok {
 		s.LastFile = file
 	}
+}
+
+// HandleWebInput processes a user prompt sent from the web dashboard.
+//
+// Called from the WebSocket handler when a dashboard client sends a send_input message.
+// Writes the prompt as a new Turn in the session timeline, persists to SQLite,
+// stores it for the OpenCode plugin to pick up via polling, and notifies all
+// WebSocket clients of the turn update.
+func (sm *SessionManager) HandleWebInput(key string, text string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sess, ok := sm.sessions[key]
+	if !ok {
+		return false
+	}
+
+	old := *sess
+
+	sess.TurnCount++
+	sess.UserInput = text
+	sess.LastEventTimeMs = time.Now().UnixMilli()
+	sess.LastEventType = "user_prompt"
+	sess.LastHookEvent = "WebInput"
+	sess.lastHookTime = time.Now().UnixMilli()
+
+	sess.Turns = append(sess.Turns, Turn{
+		TurnIdx:   len(sess.Turns),
+		UserInput: text,
+		UserTS:    sess.LastEventTimeMs,
+		Entries:   []TurnEntry{},
+	})
+	sess.webInputActive = true
+
+	sm.pendingInputs[key] = text
+
+	if sm.store != nil {
+		if err := sm.store.Upsert(sess); err != nil {
+			log.Printf("[session] upsert web input: %v", err)
+		}
+	}
+
+	if sm.notify != nil {
+		delta := sm.computeDelta(&old, sess)
+		if delta != nil {
+			sm.notify("delta", delta)
+		}
+	}
+
+	return true
+}
+
+// GetPendingInput returns and clears the pending web input for a session key.
+// Called by the OpenCode plugin via HTTP polling.
+func (sm *SessionManager) GetPendingInput(key string) string {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	text := sm.pendingInputs[key]
+	delete(sm.pendingInputs, key)
+	return text
 }
 
 // HandlePidUpdate is called by PID Scanner when an agent process is found alive.

@@ -46,6 +46,8 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", h.authMiddleware(h.handleHealth))
 	mux.HandleFunc("GET /api/sessions", h.authMiddleware(h.handleListSessions))
 	mux.HandleFunc("GET /api/sessions/{key}", h.authMiddleware(h.handleGetSession))
+	mux.HandleFunc("GET /api/sessions/{key}/pending-input", h.authMiddleware(h.handlePendingInput))
+	mux.HandleFunc("GET /api/poll-input", h.authMiddleware(h.handlePollInput))
 	mux.HandleFunc("GET /ws", h.hub.HandleWS)
 }
 
@@ -142,4 +144,41 @@ func (h *Handlers) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+
+// handlePendingInput returns and clears the pending web input for a session.
+// Polled by the OpenCode plugin to pick up user prompts sent from the dashboard.
+//
+// GET /api/sessions/{key}/pending-input
+func (h *Handlers) handlePendingInput(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	text := h.sessions.GetPendingInput(key)
+	if text == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"text": text})
+}
+
+// handlePollInput is a simplified polling endpoint for agent plugins.
+// Accepts agent_type + agent_session_id as query params, computes the
+// session key internally.
+//
+// GET /api/poll-input?agent_type=opencode&agent_session_id=xxx
+func (h *Handlers) handlePollInput(w http.ResponseWriter, r *http.Request) {
+	agentType := r.URL.Query().Get("agent_type")
+	agentSessionID := r.URL.Query().Get("agent_session_id")
+	if agentType == "" || agentSessionID == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	key := session.ComputeSessionKey(h.sessions.UserID(), h.sessions.DeviceID(), agentType, agentSessionID)
+	text := h.sessions.GetPendingInput(key)
+	if text == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"text": text})
 }

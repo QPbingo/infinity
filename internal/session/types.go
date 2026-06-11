@@ -238,8 +238,9 @@ type Session struct {
 
 	ProcessCreateTimeMs int64 `json:"process_create_time_ms,omitempty"`
 
-	lastHookTime int64
-	dbID         int64
+	lastHookTime   int64
+	dbID           int64
+	webInputActive bool // true when current turn was created by web input, suppresses next UserPromptSubmit turn creation
 }
 
 // Turn represents a single user→agent interaction round.
