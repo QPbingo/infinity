@@ -58,6 +58,13 @@ func (c *CodexInstaller) Install(hookBinPath string) error {
 	}{
 		{"SessionStart", "startup|resume"},
 		{"UserPromptSubmit", ""},
+		{"PreToolUse", "*"},
+		{"PermissionRequest", "*"},
+		{"PostToolUse", "*"},
+		{"PreCompact", ""},
+		{"PostCompact", ""},
+		{"SubagentStart", "*"},
+		{"SubagentStop", "*"},
 		{"Stop", ""},
 	}
 

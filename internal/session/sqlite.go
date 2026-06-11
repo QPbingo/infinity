@@ -2,6 +2,7 @@ package session
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -60,8 +61,9 @@ CREATE TABLE IF NOT EXISTS daemon_sessions (
     last_hook_event  TEXT DEFAULT '',
     memory_mb        REAL DEFAULT 0,
     cpu_percent      REAL DEFAULT 0,
-    turn_count       INTEGER DEFAULT 0,
-    git_branch       TEXT DEFAULT '',
+	turn_count       INTEGER DEFAULT 0,
+	turns            TEXT DEFAULT '[]',
+	git_branch       TEXT DEFAULT '',
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     ended_at         INTEGER,
@@ -82,13 +84,14 @@ CREATE TABLE IF NOT EXISTS daemon_sessions (
 //   - session_title: first user input used as title
 //   - payload:      raw JSON of the most recent hook event
 //   - last_hook_event: raw event name from the hook
-const migrationSQL = `
-ALTER TABLE daemon_sessions ADD COLUMN user_input TEXT DEFAULT '';
-ALTER TABLE daemon_sessions ADD COLUMN agent_output TEXT DEFAULT '';
-ALTER TABLE daemon_sessions ADD COLUMN session_title TEXT DEFAULT '';
-ALTER TABLE daemon_sessions ADD COLUMN payload TEXT DEFAULT '';
-ALTER TABLE daemon_sessions ADD COLUMN last_hook_event TEXT DEFAULT '';
-`
+var migrationSQLs = []string{
+	`ALTER TABLE daemon_sessions ADD COLUMN user_input TEXT DEFAULT ''`,
+	`ALTER TABLE daemon_sessions ADD COLUMN agent_output TEXT DEFAULT ''`,
+	`ALTER TABLE daemon_sessions ADD COLUMN session_title TEXT DEFAULT ''`,
+	`ALTER TABLE daemon_sessions ADD COLUMN payload TEXT DEFAULT ''`,
+	`ALTER TABLE daemon_sessions ADD COLUMN last_hook_event TEXT DEFAULT ''`,
+	`ALTER TABLE daemon_sessions ADD COLUMN turns TEXT DEFAULT '[]'`,
+}
 
 // Store wraps a SQLite database connection for session persistence.
 //
@@ -131,10 +134,10 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create table: %w", err)
 	}
 
-	// Run migrations – errors are ignored because columns may already exist.
-	// This is a best-effort migration; a more robust approach would use a schema
-	// version table, but for the current simple column additions this suffices.
-	db.Exec(migrationSQL)
+	// Run each migration independently so one failure doesn't block the rest.
+	for _, m := range migrationSQLs {
+		db.Exec(m)
+	}
 
 	return &Store{db: db}, nil
 }
@@ -177,15 +180,22 @@ func (s *Store) Upsert(sess *Session) error {
 		payload = ""
 	}
 
+	turnsJSON := "[]"
+	if len(sess.Turns) > 0 {
+		if b, err := json.Marshal(sess.Turns); err == nil {
+			turnsJSON = string(b)
+		}
+	}
+
 	_, err := s.db.Exec(`
 		INSERT INTO daemon_sessions (
 			user_id, device_id, agent_type, agent_session_id, session_key,
 			pid, terminal, cwd, status, start_time_ms,
 			last_event_time_ms, last_event_type, last_file, last_command,
 			user_input, agent_output, session_title, payload, last_hook_event,
-			memory_mb, cpu_percent, turn_count, git_branch,
+			memory_mb, cpu_percent, turn_count, turns, git_branch,
 			created_at, updated_at, ended_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, device_id, agent_type, agent_session_id) DO UPDATE SET
 			session_key = excluded.session_key,
 			pid = excluded.pid,
@@ -205,6 +215,7 @@ func (s *Store) Upsert(sess *Session) error {
 			memory_mb = excluded.memory_mb,
 			cpu_percent = excluded.cpu_percent,
 			turn_count = excluded.turn_count,
+			turns = excluded.turns,
 			git_branch = excluded.git_branch,
 			updated_at = excluded.updated_at,
 			ended_at = excluded.ended_at
@@ -213,7 +224,7 @@ func (s *Store) Upsert(sess *Session) error {
 		sess.PID, sess.Terminal, sess.CWD, string(sess.Status), sess.StartTimeMs,
 		sess.LastEventTimeMs, sess.LastEventType, sess.LastFile, sess.LastCommand,
 		sess.UserInput, sess.AgentOutput, sess.SessionTitle, payload, sess.LastHookEvent,
-		sess.MemoryMB, sess.CPUPercent, sess.TurnCount, sess.GitBranch,
+		sess.MemoryMB, sess.CPUPercent, sess.TurnCount, turnsJSON, sess.GitBranch,
 		now, now, endedAt,
 	)
 	return err
@@ -268,8 +279,8 @@ func (s *Store) LoadAll() ([]*Session, error) {
 		SELECT user_id, device_id, agent_type, agent_session_id, session_key,
 			pid, terminal, cwd, status, start_time_ms,
 			last_event_time_ms, last_event_type, last_file, last_command,
-			user_input, agent_output, session_title, payload,
-			memory_mb, cpu_percent, turn_count, git_branch,
+			user_input, agent_output, session_title, payload, last_hook_event,
+			memory_mb, cpu_percent, turn_count, turns, git_branch,
 			created_at, updated_at
 		FROM daemon_sessions
 		ORDER BY start_time_ms DESC
@@ -282,13 +293,13 @@ func (s *Store) LoadAll() ([]*Session, error) {
 	var sessions []*Session
 	for rows.Next() {
 		var s Session
-		var userInput, agentOutput, sessionTitle, payload, lastHookEvent string
+		var userInput, agentOutput, sessionTitle, payload, lastHookEvent, turnsJSON string
 		if err := rows.Scan(
 			&s.UserID, &s.DeviceID, &s.AgentType, &s.AgentSessionID, &s.SessionKey,
 			&s.PID, &s.Terminal, &s.CWD, &s.Status, &s.StartTimeMs,
 			&s.LastEventTimeMs, &s.LastEventType, &s.LastFile, &s.LastCommand,
 			&userInput, &agentOutput, &sessionTitle, &payload, &lastHookEvent,
-			&s.MemoryMB, &s.CPUPercent, &s.TurnCount, &s.GitBranch,
+			&s.MemoryMB, &s.CPUPercent, &s.TurnCount, &turnsJSON, &s.GitBranch,
 			new(int64), new(int64), // created_at, updated_at – discard
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
@@ -299,6 +310,9 @@ func (s *Store) LoadAll() ([]*Session, error) {
 		s.LastHookEvent = lastHookEvent
 		if payload != "" {
 			s.Payload = []byte(payload)
+		}
+		if turnsJSON != "" && turnsJSON != "[]" {
+			json.Unmarshal([]byte(turnsJSON), &s.Turns)
 		}
 		s.lastHookTime = s.LastEventTimeMs
 		sessions = append(sessions, &s)

@@ -31,11 +31,55 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .badge-stopped { background: #484f58; color: white; }
 .badge-disappeared { background: #da3633; color: white; }
 .badge-unknown { background: #1f6feb; color: white; }
+.badge-error { background: #da3633; color: white; }
 .badge-event { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
 .card-body { display: none; border-top: 1px solid #21262d; padding: 12px 14px 14px; background: #0d1117; }
 .card-body.open { display: block; }
 .block { margin-bottom: 10px; }
 .block-label { font-size: 0.68em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px 16px; font-size: 0.78em; }
+.info-item { display: flex; gap: 4px; }
+.info-key { color: #8b949e; }
+.info-val { color: #c9d1d9; font-family: 'SF Mono', monospace; font-size: 0.9em; }
+.empty-state { text-align: center; padding: 50px; color: #484f58; }
+
+/* ── Timeline styles ── */
+.timeline { margin-top: 6px; }
+.tl-turn { margin-bottom: 14px; border: 1px solid #21262d; border-radius: 6px; overflow: hidden; }
+.tl-turn-header { display: flex; align-items: center; padding: 6px 10px; background: #1c2128; gap: 8px; font-size: 0.75em; color: #8b949e; border-bottom: 1px solid #21262d; }
+.tl-turn-header .tl-turn-idx { color: #58a6ff; font-weight: 600; }
+.tl-entry { padding: 8px 12px; border-bottom: 1px solid #21262d; position: relative; }
+.tl-entry:last-child { border-bottom: none; }
+.tl-entry-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.tl-badge-a { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #1f6feb; color: white; }
+.tl-badge-b { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #9e6a03; color: white; }
+.tl-badge-permission { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #d29922; color: #0d1117; }
+.tl-badge-subagent { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #a371f7; color: white; }
+.tl-badge-compact { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 0.65em; font-weight: 600; background: #484f58; color: #c9d1d9; }
+.tl-error { border-left: 3px solid #f85149; background: #1a0a0a; padding: 6px 10px; font-size: 0.75em; color: #f85149; border-radius: 0 4px 4px 0; margin: 4px 0; }
+.tl-info { border-left: 2px solid #30363d; padding: 4px 10px; font-size: 0.7em; color: #8b949e; margin: 2px 0; }
+.tl-label { font-size: 0.7em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
+.tl-time { font-size: 0.65em; color: #484f58; margin-left: auto; font-family: 'SF Mono', monospace; }
+.tl-text { font-size: 0.8em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #c9d1d9; }
+.tl-user-text { font-size: 0.82em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #e6edf3; background: #1a2332; padding: 8px 12px; border-radius: 4px; margin-top: 2px; }
+.tl-tool-group-header { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.tl-tool-group-header:hover { opacity: 0.85; }
+.tl-arrow { font-size: 0.6em; transition: transform 0.15s; display: inline-block; }
+.tl-arrow.open { transform: rotate(90deg); }
+.tl-tool-count { font-size: 0.68em; color: #8b949e; }
+.tl-tools { display: none; margin-top: 6px; }
+.tl-tools.open { display: block; }
+.tl-tool { background: #010409; border: 1px solid #21262d; border-radius: 4px; padding: 6px 10px; margin-bottom: 4px; }
+.tl-tool:last-child { margin-bottom: 0; }
+.tl-tool-head { display: flex; align-items: center; gap: 8px; font-size: 0.72em; }
+.tl-tool-name { color: #d2a8ff; font-weight: 600; font-family: 'SF Mono', monospace; }
+.tl-tool-status { font-size: 0.85em; padding: 0 4px; border-radius: 3px; }
+.tl-tool-status.running { background: #9e6a03; color: #d29922; }
+.tl-tool-status.completed { background: #1a3a1a; color: #3fb950; }
+.tl-tool-status.error { background: #3a1a1a; color: #f85149; }
+.tl-tool-input, .tl-tool-output { font-size: 0.7em; color: #8b949e; font-family: 'SF Mono', monospace; margin-top: 2px; white-space: pre-wrap; word-break: break-all; max-height: 60px; overflow: auto; }
+
+/* Legacy fallback */
 .user-input { background: #1a2332; border-left: 3px solid #58a6ff; padding: 8px 12px; border-radius: 0 4px 4px 0; font-size: 0.82em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .agent-output { background: #0b1a0b; border-left: 3px solid #3fb950; padding: 8px 12px; border-radius: 0 4px 4px 0; font-size: 0.78em; font-family: 'SF Mono', monospace; white-space: pre-wrap; word-break: break-word; line-height: 1.6; }
 .payload-section { background: #010409; border: 1px solid #21262d; border-radius: 4px; margin-top: 2px; }
@@ -43,11 +87,6 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .payload-body { display: none; padding: 6px 10px; }
 .payload-body.open { display: block; }
 .payload-body pre { margin: 0; font-size: 0.7em; color: #7d8590; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px 16px; font-size: 0.78em; }
-.info-item { display: flex; gap: 4px; }
-.info-key { color: #8b949e; }
-.info-val { color: #c9d1d9; font-family: 'SF Mono', monospace; font-size: 0.9em; }
-.empty-state { text-align: center; padding: 50px; color: #484f58; }
 </style>
 </head>
 <body>
@@ -81,6 +120,7 @@ let ws = null;
 let sessions = {};
 let currentFilter = 'all';
 let expandedCards = {};
+let expandedToolGroups = {};
 
 document.querySelectorAll('.filter-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -129,9 +169,127 @@ function toggleCard(key) {
   if (body) body.classList.toggle('open', expandedCards[key]);
 }
 
+function toggleToolGroup(key, turnIdx, groupIdx) {
+  const id = key + '_' + turnIdx + '_' + groupIdx;
+  expandedToolGroups[id] = !expandedToolGroups[id];
+  const el = document.querySelector('[data-tg="' + id + '"]');
+  if (el) el.classList.toggle('open', expandedToolGroups[id]);
+  const arrow = document.querySelector('[data-arrow="' + id + '"]');
+  if (arrow) arrow.classList.toggle('open', expandedToolGroups[id]);
+}
+
 function togglePayload(key) {
   const el = document.querySelector('[data-payload="' + key + '"]');
   if (el) el.classList.toggle('open');
+}
+
+function formatTime(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  return d.toLocaleTimeString('en-US', { hour12: false });
+}
+
+function renderTimeline(turns, key) {
+  if (!turns || !turns.length) return '';
+  let html = '<div class="timeline">';
+  turns.forEach((turn, ti) => {
+    html += '<div class="tl-turn">';
+    html += '<div class="tl-turn-header"><span class="tl-turn-idx">Turn ' + (turn.turn_idx + 1) + '</span>';
+    if (turn.user_input) {
+      html += '<span style="color:#8b949e">|</span><span>' + esc(trunc(turn.user_input, 40)) + '</span>';
+    }
+    if (turn.user_ts) {
+      html += '<span class="tl-time">' + esc(formatTime(turn.user_ts)) + '</span>';
+    }
+    html += '</div>';
+
+    if (turn.user_input) {
+      html += '<div class="tl-entry">';
+      html += '<div class="tl-entry-header"><span class="tl-label">User Input</span><span class="tl-time">' + esc(formatTime(turn.user_ts)) + '</span></div>';
+      html += '<div class="tl-user-text">' + esc(turn.user_input) + '</div>';
+      html += '</div>';
+    }
+
+    turn.entries.forEach((entry, ei) => {
+      if (entry.type === 'A_thinking') {
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-a">A</span><span class="tl-label">Thinking</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
+        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'A_result') {
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-a">A</span><span class="tl-label">Result</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
+        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'B_tool_group') {
+        const tgId = key + '_' + ti + '_' + ei;
+        const isOpen = expandedToolGroups[tgId];
+        const toolCount = entry.tools ? entry.tools.length : 0;
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-b">B</span><span class="tl-label">Tool Calls</span><span class="tl-tool-count">(' + toolCount + ' tools)</span><span class="tl-time">' + esc(formatTime(entry.start_ts || entry.ts)) + '</span></div>';
+        html += '<div class="tl-tool-group-header" onclick="event.stopPropagation();toggleToolGroup(\'' + key + '\',' + ti + ',' + ei + ')">';
+        html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + tgId + '">▶</span>';
+        html += '<span style="font-size:0.75em;color:#c9d1d9">' + esc((entry.tools || []).map(t => t.name).join(', ')) + '</span>';
+        html += '</div>';
+        html += '<div class="tl-tools' + (isOpen ? ' open' : '') + '" data-tg="' + tgId + '">';
+        (entry.tools || []).forEach(tc => {
+          html += '<div class="tl-tool">';
+          html += '<div class="tl-tool-head"><span class="tl-tool-name">' + esc(tc.name) + '</span>';
+          html += '<span class="tl-tool-status ' + esc(tc.status) + '">' + esc(tc.status) + '</span>';
+          html += '<span class="tl-time">' + esc(formatTime(tc.start_ts)) + '</span></div>';
+          if (tc.input) html += '<div class="tl-tool-input">in: ' + esc(trunc(tc.input, 120)) + '</div>';
+          if (tc.output) html += '<div class="tl-tool-output">out: ' + esc(trunc(tc.output, 200)) + '</div>';
+          html += '</div>';
+        });
+        html += '</div></div>';
+      } else if (entry.type === 'B_permission') {
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-permission">B</span><span class="tl-label">Permission</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
+        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
+        html += '</div>';
+        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'B_subagent') {
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-subagent">B</span><span class="tl-label">Subagent</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
+        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
+        html += '</div>';
+        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'B_compact') {
+        html += '<div class="tl-entry">';
+        html += '<div class="tl-entry-header"><span class="tl-badge-compact">B</span><span class="tl-label">Compact</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span>';
+        if (entry.subtype) html += '<span style="font-size:0.65em;color:#8b949e">' + esc(entry.subtype) + '</span>';
+        html += '</div>';
+        html += '<div class="tl-text">' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'error') {
+        html += '<div class="tl-error">';
+        html += '<span style="font-weight:600">✕ ' + esc(entry.subtype || 'Error') + '</span>';
+        html += '<span class="tl-time" style="float:right">' + esc(formatTime(entry.ts)) + '</span>';
+        html += '<div>' + esc(entry.text) + '</div>';
+        html += '</div>';
+      } else if (entry.type === 'info') {
+        html += '<div class="tl-info">';
+        html += '<span>' + esc(entry.subtype || entry.text) + '</span>';
+        html += '<span class="tl-time" style="float:right">' + esc(formatTime(entry.ts)) + '</span>';
+        if (entry.text && entry.subtype && entry.text !== entry.subtype) {
+          html += '<div style="font-size:0.9em;color:#6e7681">' + esc(entry.text.replace(entry.subtype + ' | ', '')) + '</div>';
+        }
+        html += '</div>';
+      }
+    });
+    html += '</div>';
+  });
+  html += '</div>';
+  return html;
+}
+
+function renderLegacy(s) {
+  let html = '';
+  html += (s.user_input ? '<div class="block"><div class="block-label">User Prompt (last)</div><div class="user-input">' + esc(s.user_input) + '</div></div>' : '<div class="block"><div class="block-label">User Prompt</div><div class="user-input" style="color:#484f58;font-style:italic">(waiting for user input event)</div></div>');
+  html += (s.agent_output ? '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output">' + esc(s.agent_output) + '</div></div>' : '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output" style="color:#484f58;font-style:italic">(waiting for tool events — agent may not have run tools yet)</div></div>');
+  return html;
 }
 
 function render() {
@@ -151,6 +309,7 @@ function render() {
     const open = expandedCards[key] ? ' open' : '';
     const terminal = s.terminal || '-';
     const hasPayload = s.payload && s.payload !== 'null';
+    const hasTurns = s.turns && s.turns.length > 0;
 
     return '<div class="session-card">'
       + '<div class="card-header" onclick="toggleCard(\'' + key + '\')">'
@@ -176,9 +335,7 @@ function render() {
       + '<div class="info-item"><span class="info-key">Turns</span><span class="info-val">' + (s.turn_count||0) + '</span></div>'
       + '</div>'
 
-      + (s.user_input ? '<div class="block"><div class="block-label">User Prompt</div><div class="user-input">' + esc(s.user_input) + '</div></div>' : '<div class="block"><div class="block-label">User Prompt</div><div class="user-input" style="color:#484f58;font-style:italic">(waiting for user input event)</div></div>')
-
-      + (s.agent_output ? '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output">' + esc(s.agent_output) + '</div></div>' : '<div class="block"><div class="block-label">Agent Output / Timeline</div><div class="agent-output" style="color:#484f58;font-style:italic">(waiting for tool events — agent may not have run tools yet)</div></div>')
+      + (hasTurns ? renderTimeline(s.turns, key) : renderLegacy(s))
 
       + (hasPayload ? '<div class="payload-section"><div class="payload-header" onclick="event.stopPropagation();togglePayload(\'' + key + '\')">▶ Raw Payload</div><div class="payload-body" data-payload="' + key + '"><pre>' + esc(formatPayload(s.payload)) + '</pre></div></div>' : '')
 

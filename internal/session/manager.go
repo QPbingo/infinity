@@ -185,9 +185,6 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 
 	switch string(eventType) {
 	case "session_start":
-		// Agent explicitly started/re-started – reset to active
-		// This can happen when: user re-opens a conversation, or a stopped
-		// session gets restarted in the same agent instance.
 		sess.Status = StatusActive
 		sess.StartTimeMs = event.TimestampMs
 		sess.LastEventTimeMs = event.TimestampMs
@@ -198,20 +195,40 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		sess.lastHookTime = event.TimestampMs
 		sess.Payload = event.Payload
 
-	case "session_end":
-		// Agent conversation ended – move to terminal stopped state
-		// Extract the final model output for display in the dashboard
+	case "stop":
 		sess.Status = StatusStopped
 		sess.LastEventTimeMs = event.TimestampMs
 		sess.LastEventType = string(eventType)
 		sess.LastHookEvent = event.Event
 		sess.lastHookTime = event.TimestampMs
 		sess.extractModelOutput(event.Payload)
+		finalText := extractStringField(event.Payload, "model_output", "output", "last_assistant_message", "text", "response")
+		if finalText != "" && len(sess.Turns) > 0 {
+			turn := &sess.Turns[len(sess.Turns)-1]
+			turn.Entries = append(turn.Entries, TurnEntry{
+				Type: "A_result",
+				Text: finalText,
+				TS:   event.TimestampMs,
+			})
+		}
+
+	case "session_error", "stop_failure":
+		sess.Status = StatusError
+		sess.LastEventTimeMs = event.TimestampMs
+		sess.LastEventType = string(eventType)
+		sess.LastHookEvent = event.Event
+		sess.lastHookTime = event.TimestampMs
+		sess.applyEvent(event, eventType)
+
+	case "session_close":
+		sess.Status = StatusStopped
+		sess.LastEventTimeMs = event.TimestampMs
+		sess.LastEventType = string(eventType)
+		sess.LastHookEvent = event.Event
+		sess.lastHookTime = event.TimestampMs
+		sess.applyEvent(event, eventType)
 
 	default:
-		// All other events: user_prompt, pre_tool_use, post_tool_use, notification
-		// applyEvent() handles: updating timestamps, incrementing turn count,
-		// extracting user input, tool info, model output, and setting Status to Active
 		sess.applyEvent(event, eventType)
 	}
 
@@ -264,35 +281,469 @@ func (s *Session) applyEvent(event *HookEvent, eventType EventType) {
 	s.lastHookTime = event.TimestampMs // for idle detection
 	s.Payload = event.Payload
 
+	// ── Turn building ─────────────────────────────────────────────────
+	s.buildTurnEntry(event, eventType)
+
 	// ── Type-specific field extraction ─────────────────────────────────
 	switch eventType {
 	case EventUserPrompt:
-		// Increment interaction count
 		s.TurnCount++
-		// Capture user input for display
 		s.extractUserInput(event.Payload)
-		// Use first user input as session title
 		if s.SessionTitle == "" && s.UserInput != "" {
 			s.SessionTitle = s.UserInput
 		}
 
 	case EventPostToolUse:
-		// Extract tool name + file path, append to agent output log
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
 
 	case EventPreToolUse:
-		// Extract tool name + file path, append to agent output log
 		s.extractToolInfo(event.Payload)
 		s.appendAgentOutput(event.Payload)
 
-	case EventNotification:
-		// Extract model response text, append to agent output log
+	case EventAssistantText:
 		s.extractModelOutput(event.Payload)
+
+	case EventSessionError, EventStopFailure:
+		s.Status = StatusError
+		return
+
+	case EventSessionClose:
+		s.Status = StatusStopped
+		return
 	}
 
-	// Any hook event means the agent is active and producing output
 	s.Status = StatusActive
+}
+
+// buildTurnEntry constructs Turn entries from hook events.
+//
+// Turn lifecycle:
+//   UserPromptSubmit → starts a new turn with user_input
+//   Notification(type=thinking) → adds A_thinking entry
+//   PreToolUse → opens or adds to B_tool_group entry
+//   PostToolUse → completes tool in B_tool_group entry
+//   Notification(type=result) → adds A_result entry
+func (s *Session) buildTurnEntry(event *HookEvent, eventType EventType) {
+	switch eventType {
+	case EventUserPrompt:
+		input := extractStringField(event.Payload, "prompt", "user_input", "text", "message")
+		s.Turns = append(s.Turns, Turn{
+			TurnIdx:   len(s.Turns),
+			UserInput: input,
+			UserTS:    event.TimestampMs,
+			Entries:   []TurnEntry{},
+		})
+
+	case EventAssistantText:
+		s.addNotificationToTurn(event)
+
+	case EventPreToolUse:
+		s.addToolRunning(event)
+
+	case EventPostToolUse:
+		s.completeTool(event)
+
+	case EventToolFailure:
+		s.failTool(event)
+
+	case EventPermission:
+		s.addPermissionEntry(event)
+
+	case EventSubagent:
+		s.addSubagentEntry(event)
+
+	case EventCompact:
+		s.addCompactEntry(event)
+
+	case EventSessionError, EventStopFailure:
+		s.addErrorEntry(event)
+
+	case EventPostToolBatch:
+		s.addInfoEntry(event, "PostToolBatch")
+
+	case EventInfo:
+		s.addInfoEntry(event, event.Event)
+	}
+}
+
+func (s *Session) ensureTurn() *Turn {
+	if len(s.Turns) == 0 {
+		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: 0, Entries: []TurnEntry{}})
+	}
+	return &s.Turns[len(s.Turns)-1]
+}
+
+func (s *Session) failTool(event *HookEvent) {
+	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
+	toolOutput := extractToolOutput(event.Payload)
+	reason := extractStringField(event.Payload, "reason", "error", "message")
+	if toolName == "" {
+		return
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	found := false
+	for i := len(turn.Entries) - 1; i >= 0; i-- {
+		if turn.Entries[i].Type == "B_tool_group" {
+			for j := len(turn.Entries[i].Tools) - 1; j >= 0; j-- {
+				if turn.Entries[i].Tools[j].Status == "running" && turn.Entries[i].Tools[j].Name == toolName {
+					turn.Entries[i].Tools[j].Status = "error"
+					turn.Entries[i].Tools[j].Output = reason
+					if toolOutput != "" {
+						turn.Entries[i].Tools[j].Output = toolOutput
+					}
+					turn.Entries[i].Tools[j].EndTS = event.TimestampMs
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+	}
+	if !found {
+		tc := ToolCall{
+			Name:    toolName,
+			Status:  "error",
+			Output:  firstNonEmpty(reason, toolOutput),
+			StartTS: event.TimestampMs,
+			EndTS:   event.TimestampMs,
+		}
+		addToolToGroup(turn, tc, event.TimestampMs)
+	}
+}
+
+func (s *Session) addPermissionEntry(event *HookEvent) {
+	subtype := event.Event
+	text := buildPermissionText(event)
+	if text == "" {
+		return
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "B_permission",
+		Subtype: subtype,
+		Text:    text,
+		TS:      event.TimestampMs,
+	})
+}
+
+func buildPermissionText(event *HookEvent) string {
+	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
+	reason := extractStringField(event.Payload, "reason", "permissionDecisionReason", "message", "decisionReason")
+	decision := extractStringField(event.Payload, "permissionDecision", "decision", "behavior")
+	if toolName != "" && decision != "" {
+		return toolName + ": " + decision + (map[bool]string{true: " — " + reason, false: ""}[reason != ""])
+	}
+	if toolName != "" {
+		return toolName
+	}
+	if reason != "" {
+		return reason
+	}
+	return extractStringField(event.Payload, "text", "message", "description")
+}
+
+func (s *Session) addSubagentEntry(event *HookEvent) {
+	agentType := extractStringField(event.Payload, "agent_type", "agentType", "type")
+	agentID := extractStringField(event.Payload, "agent_id", "agentId", "id")
+	text := agentType
+	if agentID != "" {
+		text = agentType + " (" + agentID + ")"
+	}
+	if text == "" {
+		text = event.Event
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "B_subagent",
+		Subtype: event.Event,
+		Text:    text,
+		TS:      event.TimestampMs,
+	})
+}
+
+func (s *Session) addCompactEntry(event *HookEvent) {
+	trigger := extractStringField(event.Payload, "trigger", "source", "reason")
+	text := "Context compacted"
+	if trigger != "" {
+		text += " (" + trigger + ")"
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "B_compact",
+		Subtype: event.Event,
+		Text:    text,
+		TS:      event.TimestampMs,
+	})
+}
+
+func (s *Session) addErrorEntry(event *HookEvent) {
+	reason := extractStringField(event.Payload, "reason", "error", "message", "text", "model_output")
+	errorType := extractStringField(event.Payload, "error_type", "type", "status")
+	text := event.Event
+	if errorType != "" {
+		text += ": " + errorType
+	}
+	if reason != "" {
+		text += " — " + reason
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "error",
+		Subtype: event.Event,
+		Text:    text,
+		TS:      event.TimestampMs,
+	})
+}
+
+func (s *Session) addInfoEntry(event *HookEvent, label string) {
+	text := buildInfoText(event, label)
+	if text == "" {
+		return
+	}
+	s.ensureTurn()
+	turn := s.ensureTurn()
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "info",
+		Subtype: event.Event,
+		Text:    text,
+		TS:      event.TimestampMs,
+	})
+}
+
+func buildInfoText(event *HookEvent, label string) string {
+	parts := []string{label}
+	if file := extractStringField(event.Payload, "filePath", "file_path", "file", "path", "filename"); file != "" {
+		parts = append(parts, file)
+	}
+	if cwd := extractStringField(event.Payload, "cwd", "directory"); cwd != "" {
+		parts = append(parts, cwd)
+	}
+	if cmd := extractStringField(event.Payload, "command", "tool_name", "tool"); cmd != "" {
+		parts = append(parts, cmd)
+	}
+	if src := extractStringField(event.Payload, "source", "trigger", "reason", "notification_type"); src != "" {
+		parts = append(parts, src)
+	}
+	if text := extractStringField(event.Payload, "text", "message", "description"); text != "" {
+		parts = append(parts, text)
+	}
+	if len(parts) == 1 {
+		return label
+	}
+	return joinNonEmpty(parts, " | ")
+}
+
+func addToolToGroup(turn *Turn, tc ToolCall, ts int64) {
+	for i := len(turn.Entries) - 1; i >= 0; i-- {
+		if turn.Entries[i].Type == "B_tool_group" {
+			turn.Entries[i].Tools = append(turn.Entries[i].Tools, tc)
+			return
+		}
+	}
+	turn.Entries = append(turn.Entries, TurnEntry{
+		Type:    "B_tool_group",
+		Tools:   []ToolCall{tc},
+		StartTS: ts,
+	})
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func joinNonEmpty(parts []string, sep string) string {
+	var out []string
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	result := out[0]
+	for i := 1; i < len(out); i++ {
+		result += sep + out[i]
+	}
+	return result
+}
+
+// addNotificationToTurn adds an A_thinking or A_result entry to the current turn.
+func (s *Session) addNotificationToTurn(event *HookEvent) {
+	entryType := extractStringField(event.Payload, "type")
+	if entryType == "" {
+		entryType = "A_result"
+	}
+	text := extractStringField(event.Payload, "text", "last_assistant_message", "model_output", "output", "response", "message")
+	if text == "" {
+		return
+	}
+	if len(s.Turns) == 0 {
+		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: event.TimestampMs, Entries: []TurnEntry{}})
+	}
+	turn := &s.Turns[len(s.Turns)-1]
+	entry := TurnEntry{
+		Type: entryType,
+		Text: text,
+		TS:   event.TimestampMs,
+	}
+	turn.Entries = append(turn.Entries, entry)
+}
+
+// addToolRunning opens a tool call in a B_tool_group entry (or creates a new group).
+func (s *Session) addToolRunning(event *HookEvent) {
+	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
+	toolInput := extractToolInput(event.Payload)
+	if toolName == "" {
+		return
+	}
+	if len(s.Turns) == 0 {
+		s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserTS: event.TimestampMs, Entries: []TurnEntry{}})
+	}
+	turn := &s.Turns[len(s.Turns)-1]
+	tc := ToolCall{
+		Name:    toolName,
+		Input:   toolInput,
+		Status:  "running",
+		StartTS: event.TimestampMs,
+	}
+	var group *TurnEntry
+	for i := len(turn.Entries) - 1; i >= 0; i-- {
+		if turn.Entries[i].Type == "B_tool_group" {
+			group = &turn.Entries[i]
+			break
+		}
+	}
+	if group == nil {
+		turn.Entries = append(turn.Entries, TurnEntry{
+			Type:    "B_tool_group",
+			Tools:   []ToolCall{tc},
+			StartTS: event.TimestampMs,
+		})
+	} else {
+		group.Tools = append(group.Tools, tc)
+	}
+}
+
+// completeTool finds the running tool in the current turn and marks it completed.
+func (s *Session) completeTool(event *HookEvent) {
+	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
+	toolOutput := extractToolOutput(event.Payload)
+	status := extractStringField(event.Payload, "status")
+	if status == "" {
+		status = "completed"
+	}
+	if len(s.Turns) == 0 {
+		return
+	}
+	turn := &s.Turns[len(s.Turns)-1]
+	for i := len(turn.Entries) - 1; i >= 0; i-- {
+		if turn.Entries[i].Type == "B_tool_group" {
+			group := &turn.Entries[i]
+			for j := len(group.Tools) - 1; j >= 0; j-- {
+				tc := &group.Tools[j]
+				if tc.Status == "running" && (toolName == "" || tc.Name == toolName) {
+					tc.Status = status
+					tc.Output = toolOutput
+					tc.EndTS = event.TimestampMs
+					return
+				}
+			}
+		}
+	}
+}
+
+// extractStringField pulls a string value from a JSON payload by trying multiple keys.
+func extractStringField(payload json.RawMessage, keys ...string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return ""
+	}
+	for _, k := range keys {
+		if v, ok := data[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// extractToolInput extracts the tool input from a payload (command, filePath, or first key).
+func extractToolInput(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return ""
+	}
+	if input, ok := data["tool_input"].(map[string]interface{}); ok {
+		if cmd, ok := input["command"].(string); ok {
+			return cmd
+		}
+		if fp, ok := input["filePath"].(string); ok {
+			return fp
+		}
+		if fp, ok := input["file_path"].(string); ok {
+			return fp
+		}
+		for k := range input {
+			if v, ok := input[k].(string); ok {
+				return v
+			}
+		}
+	}
+	if input, ok := data["input"].(map[string]interface{}); ok {
+		if cmd, ok := input["command"].(string); ok {
+			return cmd
+		}
+		if fp, ok := input["filePath"].(string); ok {
+			return fp
+		}
+		if fp, ok := input["file_path"].(string); ok {
+			return fp
+		}
+	}
+	return ""
+}
+
+// extractToolOutput extracts the tool output from a payload.
+func extractToolOutput(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return ""
+	}
+	if out, ok := data["tool_output"].(string); ok && out != "" {
+		return out
+	}
+	if out, ok := data["output"].(string); ok && out != "" {
+		return out
+	}
+	if out, ok := data["result"].(string); ok && out != "" {
+		return out
+	}
+	if state, ok := data["state"].(map[string]interface{}); ok {
+		if out, ok := state["output"].(string); ok && out != "" {
+			return out
+		}
+	}
+	return ""
 }
 
 // extractUserInput extracts user prompt text from the event payload.
@@ -915,6 +1366,9 @@ func (sm *SessionManager) computeDelta(old, new *Session) *Delta {
 	if old.LastHookEvent != new.LastHookEvent {
 		changes["last_hook_event"] = new.LastHookEvent
 	}
+	if !turnsEqual(old.Turns, new.Turns) {
+		changes["turns"] = new.Turns
+	}
 
 	if len(changes) == 0 {
 		return nil
@@ -925,6 +1379,36 @@ func (sm *SessionManager) computeDelta(old, new *Session) *Delta {
 		Changes:     changes,
 		TimestampMs: time.Now().UnixMilli(),
 	}
+}
+
+func turnsEqual(a, b []Turn) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].TurnIdx != b[i].TurnIdx || a[i].UserInput != b[i].UserInput || a[i].UserTS != b[i].UserTS {
+			return false
+		}
+		if len(a[i].Entries) != len(b[i].Entries) {
+			return false
+		}
+		for j := range a[i].Entries {
+			ea, eb := a[i].Entries[j], b[i].Entries[j]
+			if ea.Type != eb.Type || ea.Subtype != eb.Subtype || ea.Text != eb.Text || ea.TS != eb.TS || ea.StartTS != eb.StartTS || ea.Meta != eb.Meta {
+				return false
+			}
+			if len(ea.Tools) != len(eb.Tools) {
+				return false
+			}
+			for k := range ea.Tools {
+				ta, tb := ea.Tools[k], eb.Tools[k]
+				if ta.Name != tb.Name || ta.Input != tb.Input || ta.Output != tb.Output || ta.Status != tb.Status || ta.StartTS != tb.StartTS || ta.EndTS != tb.EndTS {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func abs(x float64) float64 {
