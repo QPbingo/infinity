@@ -10,7 +10,9 @@ export const AgentMonitorPlugin = async ({ client, directory }) => {
   const startedSessions = new Set();
 
   function extractSid(props) {
-    return props?.info?.id || props?.info?.sessionID || props?.sessionID ||
+    // sessionID is the canonical session identifier across all OpenCode events.
+    // Do NOT use info.id — that is the message ID for message.updated events.
+    return props?.sessionID || props?.info?.sessionID ||
            props?.part?.sessionID || "";
   }
 

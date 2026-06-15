@@ -178,3 +178,93 @@ make test-hook SESSION=test-001   # 发送测试事件
 ```
 SessionKey = hex(SHA256(user_id|device_id|agent_type|agent_session_id))[:16]
 ```
+
+## Web 渲染数据字段层级
+
+以下是从 Go 结构体 → JSON → WebSocket → 浏览器 DOM 的完整字段映射：
+
+```
+Session                              ← 顶层，对应一个 agent 会话
+├── session_key:    string          卡片唯一标识，用于展开/折叠/delta 匹配
+├── agent_type:     string          卡片头部左侧标签 (claude/codex/opencode)
+├── session_title:  string          卡片头部标题 (fallback: agent_session_id)
+├── agent_session_id: string        卡片展开后的 "Session" 字段 (截断到 12 字符)
+├── status:         string          状态徽章 (active/idle/stopped/disappeared/error)
+├── last_hook_event: string         事件徽章，显示最近一次 hook 事件名
+├── terminal:       string          终端模拟器名称
+├── cpu_percent:    float64         CPU 占用百分比
+├── memory_mb:      float64         内存 MB
+├── turn_count:     int             Turn 计数 (T3 = 3 轮)
+├── pid:            int             进程 PID
+├── cwd:            string          工作目录 (截断到 30 字符)
+├── start_time_ms:  int64           (内部使用，未直接展示)
+├── last_event_time_ms: int64       排序依据 (最新事件排最前)
+├── last_event_type: string         (内部记录)
+├── last_file:      string          (内部记录)
+├── last_command:   string          (内部记录)
+├── git_branch:     string          (内部记录，未直接展示)
+├── user_input:     string          (最后一次用户输入，legacy 展示用)
+├── agent_output:   string          (最后一次 agent 输出，legacy 展示用)
+├── payload:        json.RawMessage 卡片底部 "Raw Payload" 折叠区 (原始 JSON)
+│
+├── turns: []Turn                   时间线，按事件分组
+│   └── Turn
+│       ├── turn_idx:   int         展示为 "Turn 1", "Turn 2" ...
+│       ├── user_input: string      用户输入文本 (展示在 turn header + 正文)
+│       ├── user_ts:    int64       时间戳
+│       └── entries: []TurnEntry    该 turn 内的所有事件条目
+│           └── TurnEntry
+│               ├── event:   string          事件名 (展示为标签，如 PreToolUse)
+│               ├── ts:      int64           时间戳
+│               ├── start_ts: int64          工具组起始时间
+│               ├── payload: json.RawMessage 事件原始 payload
+│               │   └── 通过 formatPayloadDisplay 渲染为 key: value 文本
+│               │       跳过字段: daemon_token, _role
+│               └── tools: []ToolCall         工具调用列表 (仅 PreToolUse/PostToolUse)
+│                   └── ToolCall
+│                       ├── name:    string   工具名 (Bash, Read, Write ...)
+│                       ├── status:  string   状态 (running / completed / error)
+│                       ├── input:   string   输入 (截断到 120 字符)
+│                       ├── output:  string   输出 (截断到 200 字符)
+│                       ├── start_ts: int64   开始时间
+│                       └── end_ts:  int64    结束时间
+```
+
+### WebSocket 消息到达前端的 3 种路径
+
+| 消息 type | 触发时机 | 前端处理 |
+|-----------|---------|---------|
+| `snapshot` | WebSocket 连接建立后 | 全量替换 `sessions`，渲染全部卡片 |
+| `session_added` | 新会话创建 | `sessions[key] = msg.session`，增量渲染 |
+| `delta` | 会话字段变更 | `Object.assign(sessions[key], msg.changes)`，增量更新 |
+
+### 前端数据流
+
+```
+WebSocket 消息
+    │
+    ▼
+handleMessage(msg)
+    ├── snapshot   → sessions = {} → 逐条赋值 → render()
+    ├── session_added → sessions[key] = msg.session → render()
+    └── delta      → Object.assign(sessions[key], msg.changes) → render()
+                        │
+                        ▼
+                   render()
+                     ├── 按 status 筛选
+                     ├── 按 last_event_time_ms 降序排序
+                     └── 逐 session 渲染卡片
+                           ├── 卡片头部: agent_type + title + badges + metrics
+                           ├── 卡片展开区:
+                           │     ├── info-grid (Session/PID/Terminal/CWD/Turns)
+                           │     ├── renderTimeline(turns) 或 renderLegacy()
+                           │     ├── Raw Payload 折叠区
+                           │     └── Web 输入框
+                           └── renderTimeline(turns)
+                                 ├── Turn 按时间倒序 (最新在最上)
+                                 ├── 最新 Turn 默认展开，其余折叠
+                                 ├── 每个 TurnEntry:
+                                 │     ├── 有 tools → 工具组 (折叠/展开 + input/output)
+                                 │     └── 无 tools → formatPayloadDisplay() 渲染文本
+                                 └── 长文本 (>200字符或>3行) 可折叠
+```

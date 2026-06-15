@@ -131,12 +131,6 @@ func (h *ClaudeCodeHandler) LifecycleStatus(event string) (Status, bool) {
 
 func (h *ClaudeCodeHandler) OnEvent(sess *Session, event *HookEvent) {
 	switch event.Event {
-	case "UserPromptSubmit":
-		sess.TurnCount++
-		sess.extractUserInput(event.Payload)
-		if sess.SessionTitle == "" && sess.UserInput != "" {
-			sess.SessionTitle = sess.UserInput
-		}
 	case "PreToolUse", "PostToolUse":
 		sess.extractToolInfo(event.Payload)
 		sess.appendAgentOutput(event.Payload)
@@ -237,12 +231,6 @@ func (h *CodexHandler) LifecycleStatus(event string) (Status, bool) {
 
 func (h *CodexHandler) OnEvent(sess *Session, event *HookEvent) {
 	switch event.Event {
-	case "UserPromptSubmit":
-		sess.TurnCount++
-		sess.extractUserInput(event.Payload)
-		if sess.SessionTitle == "" && sess.UserInput != "" {
-			sess.SessionTitle = sess.UserInput
-		}
 	case "PreToolUse", "PostToolUse":
 		sess.extractToolInfo(event.Payload)
 		sess.appendAgentOutput(event.Payload)

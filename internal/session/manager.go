@@ -142,6 +142,11 @@ func (s *Session) buildTurnEntry(event *HookEvent, handler AgentHandler) {
 			return
 		}
 		input := handler.ExtractUserPromptText(event)
+		s.TurnCount++
+		s.UserInput = input
+		if s.SessionTitle == "" && input != "" {
+			s.SessionTitle = input
+		}
 		s.Turns = append(s.Turns, Turn{
 			TurnIdx:   len(s.Turns),
 			UserInput: input,
