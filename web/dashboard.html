@@ -384,7 +384,7 @@ function formatPayloadDisplay(payload, eventName) {
   if (!payload || payload === 'null') return eventName;
   try {
     const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    const skip = ['hook_event_name','hookEventName','session_id','sessionId','daemon_token','turn_id','cwd','permission_mode'];
+    const skip = ['daemon_token', '_role'];
     const parts = [];
     for (const [k, v] of Object.entries(data)) {
       if (skip.includes(k)) continue;

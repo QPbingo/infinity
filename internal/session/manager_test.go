@@ -16,11 +16,11 @@ func TestBuildTurn_UserPrompt(t *testing.T) {
 	s := &Session{}
 	ev := &HookEvent{
 		Event:       "UserPromptSubmit",
-		AgentType:   "opencode",
+		AgentType:   "claude",
 		TimestampMs: 1000,
 		Payload:     makePayload(map[string]interface{}{"prompt": "hello world"}),
 	}
-	s.applyEvent(ev)
+	s.applyEvent(ev, getHandler(ev.AgentType))
 
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
@@ -46,7 +46,7 @@ func TestBuildTurn_AssistantText(t *testing.T) {
 		TimestampMs: 2000,
 		Payload:     makePayload(map[string]interface{}{"text": "I need to think about this"}),
 	}
-	s.applyEvent(ev)
+	s.applyEvent(ev, getHandler(ev.AgentType))
 	if len(s.Turns[0].Entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
 	}
@@ -67,7 +67,7 @@ func TestBuildTurn_ReasoningPart(t *testing.T) {
 		TimestampMs: 2000,
 		Payload:     makePayload(map[string]interface{}{"text": "reasoning content"}),
 	}
-	s.applyEvent(ev)
+	s.applyEvent(ev, getHandler(ev.AgentType))
 	e := s.Turns[0].Entries[0]
 	if e.Event != "ReasoningPart" {
 		t.Errorf("expected event ReasoningPart, got %q", e.Event)
@@ -85,12 +85,12 @@ func TestBuildTurn_ToolCallSingle(t *testing.T) {
 		Event: "PreToolUse", TimestampMs: 2000,
 		Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/foo.go"}}),
 	}
-	s.applyEvent(pre)
+	s.applyEvent(pre, &ClaudeCodeHandler{})
 	post := &HookEvent{
 		Event: "PostToolUse", TimestampMs: 3000,
 		Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "file content"}),
 	}
-	s.applyEvent(post)
+	s.applyEvent(post, &ClaudeCodeHandler{})
 
 	entry := s.Turns[0].Entries[0]
 	if len(entry.Tools) != 1 {
@@ -107,10 +107,10 @@ func TestBuildTurn_ToolCallSingle(t *testing.T) {
 func TestBuildTurn_ToolCallMultipleSameGroup(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/a.go"}})})
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "a"})})
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2600, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_input": map[string]interface{}{"filePath": "/b.go"}})})
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_output": "b"})})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/a.go"}})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "a"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2600, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_input": map[string]interface{}{"filePath": "/b.go"}})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Write", "tool_output": "b"})}, &ClaudeCodeHandler{})
 
 	entry := s.Turns[0].Entries[0]
 	if len(entry.Tools) != 2 {
@@ -124,8 +124,8 @@ func TestBuildTurn_ToolCallMultipleSameGroup(t *testing.T) {
 func TestBuildTurn_ToolFailure(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "tool_input": map[string]interface{}{"command": "rm -rf /"}})})
-	s.applyEvent(&HookEvent{Event: "PostToolUseFailure", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "reason": "blocked"})})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "tool_input": map[string]interface{}{"command": "rm -rf /"}})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PostToolUseFailure", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "reason": "blocked"})}, &ClaudeCodeHandler{})
 
 	if len(s.Turns[0].Entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
@@ -138,11 +138,11 @@ func TestBuildTurn_ToolFailure(t *testing.T) {
 
 func TestBuildTurn_FullTurnFlow(t *testing.T) {
 	s := &Session{}
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "sort"})})
-	s.applyEvent(&HookEvent{Event: "ReasoningPart", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "I should use quicksort"})})
-	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/main.go"}})})
-	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "pkg main"})})
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 3500, Payload: makePayload(map[string]interface{}{"text": "I wrote sort to /main.go"})})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "sort"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "ReasoningPart", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "I should use quicksort"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/main.go"}})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PostToolUse", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "pkg main"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 3500, Payload: makePayload(map[string]interface{}{"text": "I wrote sort to /main.go"})}, &ClaudeCodeHandler{})
 
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
@@ -164,10 +164,10 @@ func TestBuildTurn_FullTurnFlow(t *testing.T) {
 
 func TestBuildTurn_MultipleTurns(t *testing.T) {
 	s := &Session{}
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "first"})})
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "first response"})})
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "second"})})
-	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"text": "second response"})})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "first"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 1500, Payload: makePayload(map[string]interface{}{"text": "first response"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "second"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "AssistantText", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"text": "second response"})}, &ClaudeCodeHandler{})
 
 	if len(s.Turns) != 2 {
 		t.Fatalf("expected 2 turns, got %d", len(s.Turns))
@@ -178,9 +178,9 @@ func TestBuildTurn_GenericInfoEvents(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
 	// Any non-structural event should create a generic entry
-	s.applyEvent(&HookEvent{Event: "ConfigChange", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"source": "user_settings"})})
-	s.applyEvent(&HookEvent{Event: "FileEdited", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"filePath": "/test.go"})})
-	s.applyEvent(&HookEvent{Event: "PermissionAsked", TimestampMs: 4000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "message": "allow?"})})
+	s.applyEvent(&HookEvent{Event: "ConfigChange", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"source": "user_settings"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "FileEdited", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"filePath": "/test.go"})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "PermissionAsked", TimestampMs: 4000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "message": "allow?"})}, &ClaudeCodeHandler{})
 
 	if len(s.Turns[0].Entries) != 3 {
 		t.Fatalf("expected 3 entries, got %d", len(s.Turns[0].Entries))
@@ -200,7 +200,7 @@ func TestBuildTurn_GenericInfoEvents(t *testing.T) {
 func TestBuildTurn_WebInputActive(t *testing.T) {
 	s := &Session{webInputActive: true}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "web input", UserTS: 1000, Entries: []TurnEntry{}})
-	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "duplicate"})})
+	s.applyEvent(&HookEvent{Event: "UserPromptSubmit", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"prompt": "duplicate"})}, &ClaudeCodeHandler{})
 	// Should NOT create a new turn
 	if len(s.Turns) != 1 {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
@@ -252,15 +252,17 @@ func TestExtractStringField(t *testing.T) {
 }
 
 func TestExtractToolInput(t *testing.T) {
+	h := &ClaudeCodeHandler{}
 	p := makePayload(map[string]interface{}{"tool_input": map[string]interface{}{"command": "ls"}})
-	if v := extractToolInput(p); v != "ls" {
+	if v := h.ExtractToolInput(p); v != "ls" {
 		t.Errorf("expected ls, got %q", v)
 	}
 }
 
 func TestExtractToolOutput(t *testing.T) {
+	h := &ClaudeCodeHandler{}
 	p := makePayload(map[string]interface{}{"tool_output": "done"})
-	if v := extractToolOutput(p); v != "done" {
+	if v := h.ExtractToolOutput(p); v != "done" {
 		t.Errorf("expected done, got %q", v)
 	}
 }

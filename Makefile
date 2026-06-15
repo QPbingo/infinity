@@ -131,20 +131,35 @@ restart: build
 		echo "✗ 启动失败，查看日志: cat /tmp/agent-monitor-daemon.log"; \
 	fi
 
-# 完全重置 (清空所有数据 + 重建 + 重启)
+# 完全重置 (清空所有 hook 配置 + daemon 数据 + 重建 + 重启)
 reset: build
-	@echo "==> 停止旧 daemon..."
+	@echo "==> 1/6 停止旧 daemon..."
 	@killall agent-monitor-daemon 2>/dev/null || true
 	@sleep 0.5
-	@echo "==> 清空数据..."
-	@rm -f $(MONITOR_DIR)/daemon.db $(MONITOR_DIR)/events.jsonl $(MONITOR_DIR)/events.offset
-	@echo "==> 启动 daemon..."
+	@echo ""
+	@echo "==> 2/6 卸载全部 agent hooks..."
+	@-$(SETUP) uninstall --all 2>/dev/null
+	@echo ""
+	@echo "==> 3/6 清空 daemon 数据..."
+	@rm -f $(MONITOR_DIR)/daemon.db $(MONITOR_DIR)/daemon.db-wal $(MONITOR_DIR)/daemon.db-shm
+	@rm -f $(MONITOR_DIR)/events.jsonl $(MONITOR_DIR)/events.offset
+	@echo ""
+	@echo "==> 4/6 重新初始化环境..."
+	@$(SETUP) init
+	@echo ""
+	@echo "==> 5/6 重新注册全部 agent hooks..."
+	@$(SETUP) install --all
+	@echo ""
+	@echo "==> 6/6 启动 daemon..."
 	@nohup $(DAEMON) --listen 127.0.0.1:9101 > /tmp/agent-monitor-daemon.log 2>&1 &
 	@sleep 1
+	@echo ""
 	@if pgrep -f agent-monitor-daemon > /dev/null 2>&1; then \
-		echo "✓ 已重置 → $(DASHBOARD)"; \
+		echo "✓ 全部重置完成 → $(DASHBOARD)"; \
+		echo ""; \
+		echo "  Token: $$(cat $(MONITOR_DIR)/local-token)"; \
 	else \
-		echo "✗ 启动失败，查看日志: cat /tmp/agent-monitor-daemon.log"; \
+		echo "✗ daemon 启动失败，查看日志: cat /tmp/agent-monitor-daemon.log"; \
 	fi
 
 # 部署插件 + 重启 (开发用: 改完代码一键生效)
@@ -163,6 +178,57 @@ deploy: build
 # 查看 daemon 日志
 logs:
 	@tail -30 /tmp/agent-monitor-daemon.log 2>/dev/null || echo "无日志文件"
+
+# 诊断事件管线
+diagnose:
+	@echo "=== 1. Daemon 进程 ==="
+	@if pgrep -f agent-monitor-daemon > /dev/null 2>&1; then \
+		echo "  ● 运行中 (PID: $$(pgrep -f agent-monitor-daemon))"; \
+	else \
+		echo "  ○ 未运行 — 请先执行 make start"; \
+	fi
+	@echo ""
+	@echo "=== 2. Token ==="
+	@if [ -f "$(MONITOR_DIR)/local-token" ]; then \
+		echo "  ● 存在: $$(head -c 16 $(MONITOR_DIR)/local-token)..."; \
+	else \
+		echo "  ○ 缺失 — 请执行 make reset"; \
+	fi
+	@echo ""
+	@echo "=== 3. Hook 安装状态 ==="
+	@$(SETUP) status 2>/dev/null || echo "  (需要先 make build)"
+	@echo ""
+	@echo "=== 4. 最近事件 (events.jsonl) ==="
+	@if [ -f "$(MONITOR_DIR)/events.jsonl" ]; then \
+		lines=$$(wc -l < "$(MONITOR_DIR)/events.jsonl" 2>/dev/null); \
+		echo "  总行数: $$lines"; \
+		echo "  最近 5 条:"; \
+		tail -5 "$(MONITOR_DIR)/events.jsonl" 2>/dev/null | python3 -c "import sys,json; [print(f'    [{json.loads(l).get(\"event\",\"?\")}] agent={json.loads(l).get(\"agent_type\",\"?\")} session={json.loads(l).get(\"session_id\",\"?\")[:20]}') for l in sys.stdin if l.strip()]" 2>/dev/null || echo "    (解析失败)"; \
+	else \
+		echo "  ○ 文件不存在 — 尚无 hook 事件写入"; \
+	fi
+	@echo ""
+	@echo "=== 5. Hook 调试日志 (最近 10 行) ==="
+	@if [ -f /tmp/agent-monitor-hook.log ]; then \
+		tail -10 /tmp/agent-monitor-hook.log; \
+	else \
+		echo "  ○ 暂无调试日志"; \
+	fi
+	@echo ""
+	@echo "=== 6. 发送测试事件 ==="
+	@echo '{"session_id":"diagnose-test","hook_event_name":"SessionStart","cwd":"'$$(pwd)'"}' \
+		| $(HOOK) --agent-type claude 2>&1 || true
+	@sleep 0.2
+	@echo ""
+	@echo "=== 7. 验证测试事件是否写入 ==="
+	@if [ -f "$(MONITOR_DIR)/events.jsonl" ]; then \
+		tail -1 "$(MONITOR_DIR)/events.jsonl" 2>/dev/null | python3 -c "import sys,json; l=json.loads(sys.stdin.read()); print(f'  [{l[\"event\"]}] agent={l[\"agent_type\"]} session={l[\"session_id\"]}')" 2>/dev/null || echo "  ✗ 验证失败"; \
+	fi
+	@echo ""
+	@echo "=== 8. Daemon 健康检查 ==="
+	@if [ -f "$(MONITOR_DIR)/local-token" ]; then \
+		curl -sf http://127.0.0.1:9101/health -H "X-Daemon-Token: $$(cat $(MONITOR_DIR)/local-token)" 2>/dev/null && echo "" || echo "  ✗ daemon 未响应"; \
+	fi
 
 # 查看所有 session
 sessions:

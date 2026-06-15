@@ -56,11 +56,12 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	handler := getHandler(event.AgentType)
 	key := ComputeSessionKey(sm.userID, sm.deviceID, event.AgentType, event.SessionID)
 	sess, exists := sm.sessions[key]
 
 	if !exists {
-		if event.Event == "Stop" || event.Event == "session_end" {
+		if handler.IsTerminalEvent(event.Event) {
 			return
 		}
 		sess = &Session{
@@ -74,7 +75,7 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 			Payload:        event.Payload,
 		}
 		sm.sessions[key] = sess
-		sess.applyEvent(event)
+		sess.applyEvent(event, handler)
 		if sm.store != nil {
 			if err := sm.store.Upsert(sess); err != nil {
 				log.Printf("[session] upsert new session: %v", err)
@@ -90,26 +91,15 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 
 	old := *sess
 
-	switch event.Event {
-	case "SessionStart", "session_start":
-		sess.Status = StatusActive
+	// Update status from lifecycle events, then apply side effects.
+	if status, ok := handler.LifecycleStatus(event.Event); ok {
+		sess.Status = status
+	}
+	if event.Event == "SessionStart" || event.Event == "session_start" || event.Event == "session.created" {
 		sess.StartTimeMs = event.TimestampMs
-	case "Stop", "session_end":
-		sess.Status = StatusStopped
-	case "SessionError", "StopFailure", "session_error", "stop_failure":
-		sess.Status = StatusError
-	case "SessionEnd", "SessionClose", "SessionDeleted", "session_close", "session_deleted":
-		sess.Status = StatusStopped
 	}
 
-	sess.LastEventTimeMs = event.TimestampMs
-	sess.LastEventType = event.Event
-	sess.LastHookEvent = event.Event
-	sess.CWD = event.CWD
-	sess.PID = event.PID
-	sess.lastHookTime = event.TimestampMs
-	sess.Payload = event.Payload
-	sess.applyEvent(event)
+	sess.applyEvent(event, handler)
 
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
@@ -125,7 +115,7 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	}
 }
 
-func (s *Session) applyEvent(event *HookEvent) {
+func (s *Session) applyEvent(event *HookEvent, handler AgentHandler) {
 	s.LastEventTimeMs = event.TimestampMs
 	s.LastEventType = event.Event
 	s.LastHookEvent = event.Event
@@ -134,47 +124,24 @@ func (s *Session) applyEvent(event *HookEvent) {
 	s.lastHookTime = event.TimestampMs
 	s.Payload = event.Payload
 
-	s.buildTurnEntry(event)
+	s.buildTurnEntry(event, handler)
+	handler.OnEvent(s, event)
 
-	oldStatus := s.Status
-	switch event.Event {
-	case "UserPromptSubmit":
-		s.TurnCount++
-		s.extractUserInput(event.Payload)
-		if s.SessionTitle == "" && s.UserInput != "" {
-			s.SessionTitle = s.UserInput
-		}
-	case "PostToolUse":
-		s.extractToolInfo(event.Payload)
-		s.appendAgentOutput(event.Payload)
-	case "PreToolUse":
-		s.extractToolInfo(event.Payload)
-		s.appendAgentOutput(event.Payload)
-	case "AssistantText", "ReasoningPart":
-		s.extractModelOutput(event.Payload)
-	case "SessionError", "StopFailure", "session_error", "stop_failure":
-		s.Status = StatusError
-		return
-	case "SessionEnd", "SessionClose", "SessionDeleted", "session_close", "session_deleted":
-		s.Status = StatusStopped
-		return
-	}
-
-	if oldStatus != StatusError && oldStatus != StatusStopped {
-		if s.Status != StatusError && s.Status != StatusStopped {
-			s.Status = StatusActive
-		}
+	// Promote to active unless already in a terminal state.
+	if s.Status != StatusError && s.Status != StatusStopped {
+		s.Status = StatusActive
 	}
 }
 
-func (s *Session) buildTurnEntry(event *HookEvent) {
-	switch event.Event {
-	case "UserPromptSubmit":
+func (s *Session) buildTurnEntry(event *HookEvent, handler AgentHandler) {
+	cls := handler.ClassifyEvent(event)
+	switch cls {
+	case ClassUserPrompt:
 		if s.webInputActive {
 			s.webInputActive = false
 			return
 		}
-		input := extractStringField(event.Payload, "prompt", "user_input", "text", "message")
+		input := handler.ExtractUserPromptText(event)
 		s.Turns = append(s.Turns, Turn{
 			TurnIdx:   len(s.Turns),
 			UserInput: input,
@@ -182,14 +149,14 @@ func (s *Session) buildTurnEntry(event *HookEvent) {
 			Entries:   []TurnEntry{},
 		})
 
-	case "PreToolUse":
-		s.addToolRunning(event)
+	case ClassPreTool:
+		s.addToolRunning(event, handler)
 
-	case "PostToolUse":
-		s.completeTool(event)
+	case ClassPostTool:
+		s.completeTool(event, handler)
 
-	case "PostToolUseFailure":
-		s.failTool(event)
+	case ClassPostToolFailure:
+		s.failTool(event, handler)
 
 	default:
 		if s.webInputActive {
@@ -209,9 +176,9 @@ func (s *Session) addEventEntry(event *HookEvent) {
 	})
 }
 
-func (s *Session) addToolRunning(event *HookEvent) {
-	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
-	toolInput := extractToolInput(event.Payload)
+func (s *Session) addToolRunning(event *HookEvent, handler AgentHandler) {
+	toolName := handler.ExtractToolName(event.Payload)
+	toolInput := handler.ExtractToolInput(event.Payload)
 	if toolName == "" {
 		return
 	}
@@ -237,9 +204,9 @@ func (s *Session) addToolRunning(event *HookEvent) {
 	}
 }
 
-func (s *Session) completeTool(event *HookEvent) {
-	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
-	toolOutput := extractToolOutput(event.Payload)
+func (s *Session) completeTool(event *HookEvent, handler AgentHandler) {
+	toolName := handler.ExtractToolName(event.Payload)
+	toolOutput := handler.ExtractToolOutput(event.Payload)
 	status := extractStringField(event.Payload, "status")
 	if status == "" {
 		status = "completed"
@@ -262,9 +229,9 @@ func (s *Session) completeTool(event *HookEvent) {
 	}
 }
 
-func (s *Session) failTool(event *HookEvent) {
-	toolName := extractStringField(event.Payload, "tool_name", "tool", "toolName")
-	toolOutput := extractToolOutput(event.Payload)
+func (s *Session) failTool(event *HookEvent, handler AgentHandler) {
+	toolName := handler.ExtractToolName(event.Payload)
+	toolOutput := handler.ExtractToolOutput(event.Payload)
 	reason := extractStringField(event.Payload, "reason", "error", "message")
 	if toolName == "" {
 		return
@@ -311,69 +278,6 @@ func extractStringField(payload json.RawMessage, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := data[k].(string); ok && v != "" {
 			return v
-		}
-	}
-	return ""
-}
-
-func extractToolInput(payload json.RawMessage) string {
-	if len(payload) == 0 {
-		return ""
-	}
-	var data map[string]interface{}
-	if err := json.Unmarshal(payload, &data); err != nil {
-		return ""
-	}
-	if input, ok := data["tool_input"].(map[string]interface{}); ok {
-		if cmd, ok := input["command"].(string); ok {
-			return cmd
-		}
-		if fp, ok := input["filePath"].(string); ok {
-			return fp
-		}
-		if fp, ok := input["file_path"].(string); ok {
-			return fp
-		}
-		for k := range input {
-			if v, ok := input[k].(string); ok {
-				return v
-			}
-		}
-	}
-	if input, ok := data["input"].(map[string]interface{}); ok {
-		if cmd, ok := input["command"].(string); ok {
-			return cmd
-		}
-		if fp, ok := input["filePath"].(string); ok {
-			return fp
-		}
-		if fp, ok := input["file_path"].(string); ok {
-			return fp
-		}
-	}
-	return ""
-}
-
-func extractToolOutput(payload json.RawMessage) string {
-	if len(payload) == 0 {
-		return ""
-	}
-	var data map[string]interface{}
-	if err := json.Unmarshal(payload, &data); err != nil {
-		return ""
-	}
-	if out, ok := data["tool_output"].(string); ok && out != "" {
-		return out
-	}
-	if out, ok := data["output"].(string); ok && out != "" {
-		return out
-	}
-	if out, ok := data["result"].(string); ok && out != "" {
-		return out
-	}
-	if state, ok := data["state"].(map[string]interface{}); ok {
-		if out, ok := state["output"].(string); ok && out != "" {
-			return out
 		}
 	}
 	return ""
@@ -477,6 +381,19 @@ func (s *Session) extractModelOutput(payload json.RawMessage) {
 			s.AgentOutput += "[model] " + v
 			return
 		}
+	}
+}
+
+func (s *Session) extractBranchInfo(payload json.RawMessage) {
+	if len(payload) == 0 {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	if branch, ok := data["branch"].(string); ok && branch != "" {
+		s.GitBranch = branch
 	}
 }
 
