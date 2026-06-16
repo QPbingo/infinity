@@ -48,6 +48,14 @@ make test-hook SESSION=test-001   # 发送测试事件
 │   └── setup/main.go        # agent-monitor-setup CLI：初始化 + hook 注册管理
 ├── internal/
 │   ├── token/token.go       # Daemon 令牌生成 / 验证 / 常量时间比较
+│   ├── auth/
+│   │   ├── types.go          # User, TokenInfo 类型
+│   │   ├── store.go          # 用户 CRUD、bcrypt 认证、Bearer Token
+│   │   └── middleware.go     # Auth 中间件（兼容 X-Daemon-Token + Bearer）
+│   ├── hierarchy/
+│   │   ├── types.go          # Workspace/Project/Topic/Story/HierarchyTree 类型
+│   │   ├── store.go          # 完整 CRUD + EnsureInspiration
+│   │   └── permissions.go    # 权限表 + CheckProjectPermission 等检查函数
 │   ├── hook/eventwatcher.go # fsnotify 监听 events.jsonl，解析 + 校验 + 转发
 │   ├── session/
 │   │   ├── types.go         # SessionKey / Session / Turn / Delta / HookEvent 等类型

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/heybox/agent-monitor/internal/auth"
+	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/session"
 )
 
@@ -71,10 +73,12 @@ var upgrader = websocket.Upgrader{
 //   - The broadcast channel itself is also buffered (256) to prevent the
 //     SessionManager from blocking on WebSocket delivery.
 type WSHub struct {
-	mu       sync.RWMutex
-	clients  map[*WSClient]struct{} // Set of connected WebSocket clients
-	token    string                  // Daemon auth token for client verification
-	sessions *session.SessionManager // Reference for full snapshots on connect
+	mu        sync.RWMutex
+	clients   map[*WSClient]struct{}
+	token     string
+	sessions  *session.SessionManager
+	hierStore *hierarchy.Store
+	authStore *auth.Store // For bearer token validation in WS auth
 
 	// Channels for the event loop (Run goroutine)
 	register   chan *WSClient // New client connected
@@ -87,11 +91,13 @@ type WSHub struct {
 // Channel buffers:
 //   - broadcast: 256  – buffer session updates so SessionManager doesn't block.
 //   - register/unregister: unbuffered – synchronous, lightweight operations.
-func NewWSHub(token string, sessions *session.SessionManager) *WSHub {
+func NewWSHub(token string, sessions *session.SessionManager, hierStore *hierarchy.Store, authStore *auth.Store) *WSHub {
 	return &WSHub{
 		clients:    make(map[*WSClient]struct{}),
 		token:      token,
 		sessions:   sessions,
+		hierStore:  hierStore,
+		authStore:  authStore,
 		register:   make(chan *WSClient),
 		unregister: make(chan *WSClient),
 		broadcast:  make(chan []byte, 256),
@@ -192,6 +198,12 @@ func (h *WSHub) Notify(eventType string, data interface{}) {
 		msg = map[string]interface{}{
 			"type":    "session_added",
 			"session": sess,
+		}
+
+	case "hierarchy_updated":
+		msg = map[string]interface{}{
+			"type":      "hierarchy_updated",
+			"hierarchy": data,
 		}
 
 	default:
@@ -309,7 +321,12 @@ func (c *WSClient) readPump() {
 		return
 	}
 
-	if authMsg.Token != c.hub.token {
+	tokenValid := authMsg.Token == c.hub.token
+	if !tokenValid && c.hub.authStore != nil {
+		_, err := c.hub.authStore.ValidateToken(authMsg.Token)
+		tokenValid = (err == nil)
+	}
+	if !tokenValid {
 		c.sendJSON(map[string]string{"type": "auth_error"})
 		return
 	}
@@ -325,6 +342,17 @@ func (c *WSClient) readPump() {
 		"gen_time_ms": snapshot.GenTimeMs,
 	}
 	c.sendJSON(snapMsg)
+
+	// Send hierarchy snapshot if hierarchy store is configured
+	if c.hub.hierStore != nil {
+		tree, err := c.hub.hierStore.GetFullHierarchy()
+		if err == nil {
+			c.sendJSON(map[string]interface{}{
+				"type":      "hierarchy_snapshot",
+				"hierarchy": tree,
+			})
+		}
+	}
 
 	// ── Read loop – handle ping and send_input messages ─────────────────
 	for {

@@ -91,6 +91,7 @@ var migrationSQLs = []string{
 	`ALTER TABLE daemon_sessions ADD COLUMN payload TEXT DEFAULT ''`,
 	`ALTER TABLE daemon_sessions ADD COLUMN last_hook_event TEXT DEFAULT ''`,
 	`ALTER TABLE daemon_sessions ADD COLUMN turns TEXT DEFAULT '[]'`,
+	`ALTER TABLE daemon_sessions ADD COLUMN story_id INTEGER`,
 }
 
 // Store wraps a SQLite database connection for session persistence.
@@ -142,11 +143,12 @@ func NewStore(dbPath string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// DB returns the underlying *sql.DB for sharing with other packages.
+func (s *Store) DB() (*sql.DB, error) {
+	return s.db, nil
+}
+
 // Close closes the database connection.
-//
-// Should be deferred in main() to ensure clean shutdown:
-//
-//	defer store.Close()
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -281,7 +283,7 @@ func (s *Store) LoadAll() ([]*Session, error) {
 			last_event_time_ms, last_event_type, last_file, last_command,
 			user_input, agent_output, session_title, payload, last_hook_event,
 			memory_mb, cpu_percent, turn_count, turns, git_branch,
-			created_at, updated_at
+			story_id, created_at, updated_at
 		FROM daemon_sessions
 		ORDER BY start_time_ms DESC
 	`)
@@ -294,15 +296,19 @@ func (s *Store) LoadAll() ([]*Session, error) {
 	for rows.Next() {
 		var s Session
 		var userInput, agentOutput, sessionTitle, payload, lastHookEvent, turnsJSON string
+			var storyID sql.NullInt64
 		if err := rows.Scan(
 			&s.UserID, &s.DeviceID, &s.AgentType, &s.AgentSessionID, &s.SessionKey,
 			&s.PID, &s.Terminal, &s.CWD, &s.Status, &s.StartTimeMs,
 			&s.LastEventTimeMs, &s.LastEventType, &s.LastFile, &s.LastCommand,
 			&userInput, &agentOutput, &sessionTitle, &payload, &lastHookEvent,
 			&s.MemoryMB, &s.CPUPercent, &s.TurnCount, &turnsJSON, &s.GitBranch,
-			new(int64), new(int64), // created_at, updated_at – discard
+			&storyID, new(int64), new(int64),
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		if storyID.Valid {
+			s.StoryID = &storyID.Int64
 		}
 		s.UserInput = userInput
 		s.AgentOutput = agentOutput

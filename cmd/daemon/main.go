@@ -84,6 +84,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/heybox/agent-monitor/internal/auth"
+	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/hook"
 	"github.com/heybox/agent-monitor/internal/scanner"
 	"github.com/heybox/agent-monitor/internal/server"
@@ -155,6 +157,28 @@ func main() {
 	// SessionKey = hex(SHA256(userID|deviceID|agentType|agentSessionID))[:16]
 	mgr := session.NewSessionManager(store, *userID, deviceID)
 	mgr.LoadFromStore()
+
+	// ── Step 5.5: Auth + hierarchy initialization ──────────────────────────
+	var authStore *auth.Store
+	var hierStore *hierarchy.Store
+	if sdb, err := store.DB(); err == nil {
+		authStore = auth.NewStore(sdb)
+		if err := authStore.EnsureTables(); err != nil {
+			log.Printf("[auth] create tables: %v", err)
+		}
+
+		hierStore = hierarchy.NewStore(sdb)
+		if err := hierStore.EnsureTables(); err != nil {
+			log.Printf("[hierarchy] create tables: %v", err)
+		}
+
+		// Ensure inspiration workspace exists
+		if _, _, err := hierStore.EnsureInspiration(); err != nil {
+			log.Printf("[hierarchy] ensure inspiration: %v", err)
+		} else {
+			mgr.SetHierarchyStore(hierStore)
+		}
+	}
 
 	// ── Step 6: Session recovery from agent transcripts ────────────────────
 	// When the daemon starts, it may have missed sessions that were active
@@ -240,13 +264,16 @@ func main() {
 	//   1. auth_ok confirmation
 	//   2. Full snapshot of all sessions
 	//   3. Real-time delta updates as sessions change
-	srv := server.New(*listen, mgr, tok)
+	srv := server.New(*listen, mgr, tok, authStore, hierStore)
 
 	// Wire SessionManager notifications to WebSocket broadcasts.
 	// Whenever a session is created or modified, SetNotify calls back
 	// with the event type ("delta" or "session_added") and the changed data.
 	// The hub serializes this and broadcasts to all connected dashboard clients.
 	mgr.SetNotify(func(eventType string, data interface{}) {
+		srv.GetHub().Notify(eventType, data)
+	})
+	mgr.SetHierarchyNotify(func(eventType string, data interface{}) {
 		srv.GetHub().Notify(eventType, data)
 	})
 

@@ -227,8 +227,7 @@ func (r *Recovery) scanClaudeTranscripts(cutoff time.Time) []RecoveryCandidate {
 			if !strings.HasSuffix(info.Name(), ".jsonl") {
 				return nil
 			}
-			// BUG: agent type should be "claude", not "codex"
-			cands := r.scanTranscriptFile(path, "codex", cutoff)
+			cands := r.scanTranscriptFile(path, "claude", cutoff)
 			candidates = append(candidates, cands...)
 			return nil
 		})

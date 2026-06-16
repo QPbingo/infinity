@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/scanner"
 )
 
@@ -20,6 +21,8 @@ type SessionManager struct {
 	userID        string
 	deviceID      string
 	pendingInputs map[string]string
+	hierStore     *hierarchy.Store
+	hierNotify    NotifyFunc // callback for hierarchy updates
 }
 
 func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
@@ -32,9 +35,11 @@ func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	}
 }
 
-func (sm *SessionManager) SetNotify(fn NotifyFunc) { sm.notify = fn }
-func (sm *SessionManager) UserID() string          { return sm.userID }
-func (sm *SessionManager) DeviceID() string        { return sm.deviceID }
+func (sm *SessionManager) SetNotify(fn NotifyFunc)        { sm.notify = fn }
+func (sm *SessionManager) SetHierarchyStore(h *hierarchy.Store)       { sm.hierStore = h }
+func (sm *SessionManager) SetHierarchyNotify(fn NotifyFunc)            { sm.hierNotify = fn }
+func (sm *SessionManager) UserID() string               { return sm.userID }
+func (sm *SessionManager) DeviceID() string             { return sm.deviceID }
 
 func (sm *SessionManager) LoadFromStore() {
 	sessions, err := sm.store.LoadAll()
@@ -76,6 +81,26 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		}
 		sm.sessions[key] = sess
 		sess.applyEvent(event, handler)
+
+			// Auto-assign to inspiration project
+			if sm.hierStore != nil {
+				title := sess.SessionTitle
+				if title == "" {
+					title = sess.AgentSessionID
+				}
+				story, err := sm.hierStore.FindOrCreateInspirationStory(event.AgentType, key, title)
+				if err != nil {
+					log.Printf("[session] auto-assign story: %v", err)
+				} else {
+					sess.StoryID = &story.ID
+					if sm.hierNotify != nil {
+						if tree, err := sm.hierStore.GetFullHierarchy(); err == nil {
+							sm.hierNotify("hierarchy_updated", tree)
+						}
+					}
+				}
+			}
+
 		if sm.store != nil {
 			if err := sm.store.Upsert(sess); err != nil {
 				log.Printf("[session] upsert new session: %v", err)
