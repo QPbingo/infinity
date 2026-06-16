@@ -87,6 +87,11 @@ h1 { font-size: 1.3em; margin-bottom: 4px; color: #58a6ff; }
 .tl-tool-status.completed { background: #1a3a1a; color: #3fb950; }
 .tl-tool-status.error { background: #3a1a1a; color: #f85149; }
 .tl-tool-input, .tl-tool-output { font-size: 0.7em; color: #8b949e; font-family: 'SF Mono', monospace; margin-top: 2px; white-space: pre-wrap; word-break: break-all; max-height: 60px; overflow: auto; }
+.tl-payload-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; padding: 2px 0; margin-top: 4px; font-size: 0.68em; color: #8b949e; }
+.tl-payload-toggle:hover { color: #c9d1d9; }
+.tl-payload-body { display: none; margin-top: 4px; background: #010409; border: 1px solid #21262d; border-radius: 4px; padding: 8px 10px; }
+.tl-payload-body.open { display: block; }
+.tl-payload-body pre { margin: 0; font-size: 0.7em; color: #7d8590; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: 'SF Mono', monospace; }
 
 /* Legacy fallback */
 .user-input { background: #1a2332; border-left: 3px solid #58a6ff; padding: 8px 12px; border-radius: 0 4px 4px 0; font-size: 0.82em; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
@@ -130,7 +135,7 @@ let sessions = {};
 let currentFilter = 'all';
 let expandedCards = {};
 let expandedToolGroups = {};
-let expandedResults = {};
+let expandedPayloads = {};
 let expandedTurns = {};
 
 document.querySelectorAll('.filter-btn').forEach(btn => {
@@ -189,13 +194,13 @@ function toggleToolGroup(key, turnIdx, groupIdx) {
   if (arrow) arrow.classList.toggle('open', expandedToolGroups[id]);
 }
 
-function toggleResult(key, turnIdx, entryIdx) {
+function toggleEntryPayload(key, turnIdx, entryIdx) {
   const id = key + '_' + turnIdx + '_' + entryIdx;
-  expandedResults[id] = !expandedResults[id];
-  const el = document.querySelector('[data-res="' + id + '"]');
-  if (el) el.classList.toggle('open', expandedResults[id]);
-  const arrow = document.querySelector('[data-arrow="' + id + '"]');
-  if (arrow) arrow.classList.toggle('open', expandedResults[id]);
+  expandedPayloads[id] = !expandedPayloads[id];
+  const body = document.querySelector('[data-payload-body="' + id + '"]');
+  if (body) body.classList.toggle('open', expandedPayloads[id]);
+  const arrow = document.querySelector('[data-payload-arrow="' + id + '"]');
+  if (arrow) arrow.classList.toggle('open', expandedPayloads[id]);
 }
 
 function toggleTurn(key, turnIdx) {
@@ -260,16 +265,26 @@ function renderTimeline(turns, key) {
 
     turn.entries.forEach((entry, ei) => {
       const tools = entry.tools;
-      if (tools && tools.length > 0) {
-        const tgId = key + '_' + ti + '_' + ei;
-        const isOpen = expandedToolGroups[tgId];
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-label">' + esc(entry.event) + '</span><span class="tl-tool-count">(' + tools.length + ' tools)</span><span class="tl-time">' + esc(formatTime(entry.start_ts || entry.ts)) + '</span></div>';
+      const hasTools = tools && tools.length > 0;
+      const payloadId = key + '_' + ti + '_' + ei;
+      const payloadOpen = expandedPayloads[payloadId];
+      const payloadText = formatPayloadDisplay(entry.payload, entry.event);
+
+      html += '<div class="tl-entry">';
+      html += '<div class="tl-entry-header">';
+      html += '<span class="tl-label">' + esc(entry.event) + '</span>';
+      if (hasTools) html += '<span class="tl-tool-count">(' + tools.length + ' tools)</span>';
+      html += '<span class="tl-time">' + esc(formatTime(entry.start_ts || entry.ts)) + '</span>';
+      html += '</div>';
+
+      if (hasTools) {
+        const tgId = payloadId;
+        const tgOpen = expandedToolGroups[tgId];
         html += '<div class="tl-tool-group-header" onclick="event.stopPropagation();toggleToolGroup(\'' + key + '\',' + ti + ',' + ei + ')">';
-        html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + tgId + '">▶</span>';
+        html += '<span class="tl-arrow' + (tgOpen ? ' open' : '') + '" data-arrow="' + tgId + '">▶</span>';
         html += '<span style="font-size:0.75em;color:#c9d1d9">' + esc(tools.map(t => t.name).join(', ')) + '</span>';
         html += '</div>';
-        html += '<div class="tl-tools' + (isOpen ? ' open' : '') + '" data-tg="' + tgId + '">';
+        html += '<div class="tl-tools' + (tgOpen ? ' open' : '') + '" data-tg="' + tgId + '">';
         tools.forEach(tc => {
           html += '<div class="tl-tool">';
           html += '<div class="tl-tool-head"><span class="tl-tool-name">' + esc(tc.name) + '</span>';
@@ -279,26 +294,17 @@ function renderTimeline(turns, key) {
           if (tc.output) html += '<div class="tl-tool-output">out: ' + esc(trunc(tc.output, 200)) + '</div>';
           html += '</div>';
         });
-        html += '</div></div>';
-      } else {
-        const payload = entry.payload;
-        const text = formatPayloadDisplay(payload, entry.event);
-        const resId = key + '_' + ti + '_' + ei;
-        const isOpen = expandedResults[resId];
-        const long = text.length > 200 || text.split('\n').length > 3;
-        html += '<div class="tl-entry">';
-        html += '<div class="tl-entry-header"><span class="tl-label">' + esc(entry.event) + '</span><span class="tl-time">' + esc(formatTime(entry.ts)) + '</span></div>';
-        if (long) {
-          html += '<div class="tl-collapse-header" onclick="event.stopPropagation();toggleResult(\'' + key + '\',' + ti + ',' + ei + ')">';
-          html += '<span class="tl-arrow' + (isOpen ? ' open' : '') + '" data-arrow="' + resId + '">▶</span>';
-          html += '<span style="font-size:0.7em;color:#8b949e">' + esc(text.split('\n')[0].substring(0, 80)) + '...</span>';
-          html += '</div>';
-          html += '<div class="tl-result-body' + (isOpen ? ' open' : '') + '" data-res="' + resId + '"><div class="tl-text">' + esc(text) + '</div></div>';
-        } else if (text) {
-          html += '<div class="tl-text">' + esc(text) + '</div>';
-        }
         html += '</div>';
       }
+
+      if (payloadText && payloadText !== entry.event) {
+        html += '<div class="tl-payload-toggle" onclick="event.stopPropagation();toggleEntryPayload(\'' + key + '\',' + ti + ',' + ei + ')">';
+        html += '<span class="tl-arrow' + (payloadOpen ? ' open' : '') + '" data-payload-arrow="' + payloadId + '">▶</span> Payload';
+        html += '</div>';
+        html += '<div class="tl-payload-body' + (payloadOpen ? ' open' : '') + '" data-payload-body="' + payloadId + '"><pre>' + esc(payloadText) + '</pre></div>';
+      }
+
+      html += '</div>';
     });
     html += '</div>'; // tl-turn-body
     html += '</div>'; // tl-turn
@@ -384,23 +390,10 @@ function formatPayloadDisplay(payload, eventName) {
   if (!payload || payload === 'null') return eventName;
   try {
     const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    const skip = ['daemon_token', '_role'];
-    const parts = [];
-    for (const [k, v] of Object.entries(data)) {
-      if (skip.includes(k)) continue;
-      if (typeof v === 'string') parts.push(k + ': ' + v);
-      else if (typeof v === 'object' && v !== null) {
-        const inner = [];
-        for (const [ik, iv] of Object.entries(v)) {
-          if (typeof iv === 'string') inner.push(ik + ': ' + iv);
-        }
-        if (inner.length) parts.push(k + ' { ' + inner.join(', ') + ' }');
-        else parts.push(k + ': ' + JSON.stringify(v));
-      } else if (v !== undefined && v !== null) {
-        parts.push(k + ': ' + v);
-      }
-    }
-    return parts.join('\n') || eventName;
+    const cleaned = { ...data };
+    delete cleaned.daemon_token;
+    delete cleaned._role;
+    return JSON.stringify(cleaned, null, 2);
   } catch (_) { return eventName; }
 }
 

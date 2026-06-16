@@ -76,7 +76,7 @@ export const AgentMonitorPlugin = async ({ client, directory }) => {
         if (id) startedSessions.add(id);
       }
 
-      // Track message roles for message.part.updated correlation
+      // Track message roles for .updated correlation
       if (t === "message.updated") {
         const info = p?.info;
         if (info?.id && info?.sessionID) {
@@ -84,10 +84,10 @@ export const AgentMonitorPlugin = async ({ client, directory }) => {
         }
       }
 
-      // Build payload — for message.part.updated text parts, embed the
+      // Build payload — for .updated text parts, embed the
       // message role so the session manager can distinguish user vs assistant.
       let payload = p;
-      if (t === "message.part.updated") {
+      if (t === ".updated") {
         const part = p?.part;
         if (part?.type === "text" && part?.messageID) {
           const meta = msgRoles.get(part.messageID);
