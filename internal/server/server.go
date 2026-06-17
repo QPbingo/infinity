@@ -60,6 +60,7 @@ import (
 	"github.com/heybox/agent-monitor/internal/auth"
 	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/session"
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 // Server wraps the HTTP server and WebSocket Hub.
@@ -83,12 +84,12 @@ type Server struct {
 //
 // Routes are registered immediately on the ServeMux. The server doesn't
 // start listening until Start() is called.
-func New(addr string, sessions *session.SessionManager, token string, authStore *auth.Store, hierStore *hierarchy.Store) *Server {
+func New(addr string, sessions *session.SessionManager, token string, authStore *auth.Store, hierStore *hierarchy.Store, agentMgr *sdk.AgentManager) *Server {
 	// Create the WebSocket Hub (manages all connected dashboard clients)
-	hub := NewWSHub(token, sessions, hierStore, authStore)
+	hub := NewWSHub(token, sessions, hierStore, authStore, agentMgr)
 
 	// Create HTTP route handlers
-	handlers := NewHandlers(sessions, token, hub, authStore, hierStore)
+	handlers := NewHandlers(sessions, token, hub, authStore, hierStore, agentMgr)
 
 	// Register all routes on the ServeMux
 	mux := http.NewServeMux()

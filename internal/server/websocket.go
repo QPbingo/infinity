@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -11,6 +14,7 @@ import (
 	"github.com/heybox/agent-monitor/internal/auth"
 	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/session"
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 // WebSocket constants control connection behavior and heartbeat timing.
@@ -78,7 +82,8 @@ type WSHub struct {
 	token     string
 	sessions  *session.SessionManager
 	hierStore *hierarchy.Store
-	authStore *auth.Store // For bearer token validation in WS auth
+	authStore *auth.Store
+	agentMgr  *sdk.AgentManager
 
 	// Channels for the event loop (Run goroutine)
 	register   chan *WSClient // New client connected
@@ -91,13 +96,14 @@ type WSHub struct {
 // Channel buffers:
 //   - broadcast: 256  – buffer session updates so SessionManager doesn't block.
 //   - register/unregister: unbuffered – synchronous, lightweight operations.
-func NewWSHub(token string, sessions *session.SessionManager, hierStore *hierarchy.Store, authStore *auth.Store) *WSHub {
+func NewWSHub(token string, sessions *session.SessionManager, hierStore *hierarchy.Store, authStore *auth.Store, agentMgr *sdk.AgentManager) *WSHub {
 	return &WSHub{
 		clients:    make(map[*WSClient]struct{}),
 		token:      token,
 		sessions:   sessions,
 		hierStore:  hierStore,
 		authStore:  authStore,
+		agentMgr:   agentMgr,
 		register:   make(chan *WSClient),
 		unregister: make(chan *WSClient),
 		broadcast:  make(chan []byte, 256),
@@ -141,18 +147,16 @@ func (h *WSHub) Run() {
 		case message := <-h.broadcast:
 			// Broadcast a session update to all connected clients
 			// Non-blocking send: if client buffer is full, disconnect it
-			h.mu.RLock()
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
-					// Message delivered to writePump
 				default:
-					// Client is too slow – disconnect to prevent memory leak
 					close(client.send)
 					delete(h.clients, client)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 		}
 	}
 }
@@ -269,9 +273,10 @@ func (h *WSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 //   - readPump:  Reads from conn → Hub actions (auth, ping/pong).
 //   - writePump: Reads from send channel → writes to conn.
 type WSClient struct {
-	hub  *WSHub
-	conn *websocket.Conn
-	send chan []byte
+	hub     *WSHub
+	conn    *websocket.Conn
+	send    chan []byte
+	writeMu sync.Mutex // protects conn.WriteMessage / SetWriteDeadline
 }
 
 // readPump reads messages from the WebSocket connection.
@@ -354,6 +359,14 @@ func (c *WSClient) readPump() {
 		}
 	}
 
+	// Send execution history (survives tab closes)
+	if c.hub.agentMgr != nil {
+		c.sendJSON(map[string]interface{}{
+			"type":       "agent_executions",
+			"executions": c.hub.agentMgr.Executions.List(),
+		})
+	}
+
 	// ── Read loop – handle ping and send_input messages ─────────────────
 	for {
 		_, message, err := c.conn.ReadMessage()
@@ -374,6 +387,10 @@ func (c *WSClient) readPump() {
 			if key != "" && text != "" {
 				c.hub.sessions.HandleWebInput(key, text)
 			}
+		case "agent_prompt":
+			go c.handleAgentPrompt(msg)
+		case "agent_cancel":
+			go c.handleAgentCancel(msg)
 		}
 	}
 }
@@ -402,22 +419,26 @@ func (c *WSClient) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			// Send a session update (delta or session_added)
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// Hub closed the send channel (client disconnected)
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.writeMu.Unlock()
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				c.writeMu.Unlock()
 				return
 			}
+			c.writeMu.Unlock()
 		case <-ticker.C:
-			// Send server-initiated ping (WebSocket control frame)
+			c.writeMu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				c.writeMu.Unlock()
 				return
 			}
+			c.writeMu.Unlock()
 		}
 	}
 }
@@ -429,11 +450,129 @@ func (c *WSClient) writePump() {
 //
 // Errors from marshal or write are silently ignored – if we can't send the
 // auth response, the readPump's defer will clean up the connection anyway.
+// handleAgentPrompt processes an agent_prompt WebSocket message.
+// Execution runs in the background independently of the WebSocket connection.
+// Results are stored in ExecutionStore so they survive tab closes.
+func (c *WSClient) handleAgentPrompt(msg map[string]interface{}) {
+	agentType, _ := msg["agent_type"].(string)
+	sessionID, _ := msg["session_id"].(string)
+	prompt, _ := msg["prompt"].(string)
+	if agentType == "" || prompt == "" {
+		return
+	}
+	if c.hub.agentMgr == nil {
+		c.sendJSON(map[string]string{"type": "agent_error", "error": "agent manager not configured"})
+		return
+	}
+
+	// Parse timeout — user-specified in minutes, default 10, max 120
+	timeoutMin := 10
+	if v, ok := msg["timeout_minutes"].(float64); ok && v > 0 {
+		timeoutMin = int(v)
+		if timeoutMin > 120 {
+			timeoutMin = 120
+		}
+	}
+
+	store := c.hub.agentMgr.Executions
+	execID := generateExecutionID()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+
+	// Auto-create session if needed
+	agent := sdk.AgentType(agentType)
+	if sessionID == "" {
+		sess, err := c.hub.agentMgr.CreateSession(ctx, agent, sdk.SessionOptions{Title: truncatePrompt(prompt, 60)})
+		if err != nil {
+			c.sendJSON(map[string]string{"type": "agent_error", "error": err.Error()})
+			cancel()
+			return
+		}
+		sessionID = sess.ID
+		c.sendJSON(map[string]interface{}{
+			"type": "agent_session_created", "agent_type": agentType,
+			"session_id": sessionID, "exec_id": execID,
+		})
+	}
+
+	// Register in execution store so reconnecting clients can see it
+	store.Create(execID, sessionID, agent, prompt, cancel)
+
+	// Send exec_created to all clients so the sidebar updates
+	c.sendJSON(map[string]interface{}{
+		"type": "agent_exec_started", "exec_id": execID,
+		"agent_type": agentType, "session_id": sessionID, "prompt": prompt,
+	})
+
+	ch, err := c.hub.agentMgr.SendPrompt(ctx, agent, sessionID, prompt)
+	if err != nil {
+		store.Fail(execID, err.Error())
+		c.sendJSON(map[string]string{"type": "agent_error", "error": err.Error()})
+		cancel()
+		return
+	}
+
+	go func() {
+		defer cancel()
+		for msg := range ch {
+			store.AppendMessage(execID, msg)
+			c.sendJSON(map[string]interface{}{
+				"type": "agent_message", "exec_id": execID,
+				"agent_type": agentType, "session_id": sessionID,
+				"msg_type": string(msg.Type), "content": msg.Content,
+				"tool_name": msg.ToolName, "tool_input": msg.ToolInput,
+				"is_final": msg.IsFinal, "error": msg.Error,
+			})
+			if msg.Type == sdk.MessageTypeError && msg.IsFinal {
+				store.Fail(execID, msg.Error)
+				return
+			}
+		}
+		store.Complete(execID)
+	}()
+}
+
+func (c *WSClient) handleAgentCancel(msg map[string]interface{}) {
+	agentType, _ := msg["agent_type"].(string)
+	sessionID, _ := msg["session_id"].(string)
+	execID, _ := msg["exec_id"].(string)
+	if c.hub.agentMgr == nil || agentType == "" {
+		return
+	}
+	// Cancel the execution in the store (calls the stored cancelFn)
+	if execID != "" {
+		c.hub.agentMgr.Executions.Cancel(execID)
+	}
+	// Also kill the subprocess directly
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.hub.agentMgr.CancelExecution(ctx, sdk.AgentType(agentType), sessionID); err != nil {
+		c.sendJSON(map[string]string{"type": "agent_error", "error": err.Error()})
+	} else {
+		c.sendJSON(map[string]string{"type": "agent_cancelled", "session_id": sessionID})
+	}
+}
+
+func generateExecutionID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return "exec_" + hex.EncodeToString(b)
+}
+
+func truncatePrompt(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
 func (c *WSClient) sendJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	c.conn.WriteMessage(websocket.TextMessage, data)
 }

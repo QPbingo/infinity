@@ -91,6 +91,7 @@ import (
 	"github.com/heybox/agent-monitor/internal/server"
 	"github.com/heybox/agent-monitor/internal/session"
 	"github.com/heybox/agent-monitor/internal/token"
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 func main() {
@@ -264,7 +265,14 @@ func main() {
 	//   1. auth_ok confirmation
 	//   2. Full snapshot of all sessions
 	//   3. Real-time delta updates as sessions change
-	srv := server.New(*listen, mgr, tok, authStore, hierStore)
+	// Initialize agent SDK manager
+	agentMgr := sdk.NewAgentManager()
+	agentMgr.Register(sdk.AgentClaude, sdk.NewClaudeSDK(sdk.ClaudeOptions{}))
+	agentMgr.Register(sdk.AgentOpenCode, sdk.NewOpenCodeSDK(sdk.OpenCodeOptions{}))
+	agentMgr.Register(sdk.AgentCodex, sdk.NewCodexSDK(sdk.CodexOptions{}))
+	defer agentMgr.CloseAll()
+
+	srv := server.New(*listen, mgr, tok, authStore, hierStore, agentMgr)
 
 	// Wire SessionManager notifications to WebSocket broadcasts.
 	// Whenever a session is created or modified, SetNotify calls back

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/session"
 	"github.com/heybox/agent-monitor/internal/token"
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 type Handlers struct {
@@ -19,10 +21,11 @@ type Handlers struct {
 	hub       *WSHub
 	authStore *auth.Store
 	hierStore *hierarchy.Store
+	agentMgr  *sdk.AgentManager
 }
 
-func NewHandlers(s *session.SessionManager, tok string, hub *WSHub, as *auth.Store, hs *hierarchy.Store) *Handlers {
-	return &Handlers{sessions: s, token: tok, hub: hub, authStore: as, hierStore: hs}
+func NewHandlers(s *session.SessionManager, tok string, hub *WSHub, as *auth.Store, hs *hierarchy.Store, am *sdk.AgentManager) *Handlers {
+	return &Handlers{sessions: s, token: tok, hub: hub, authStore: as, hierStore: hs, agentMgr: am}
 }
 
 func (h *Handlers) Register(mux *http.ServeMux) {
@@ -61,6 +64,16 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/permissions/project/{id}", h.userMiddleware(h.handleSetProjectPerm))
 	mux.HandleFunc("DELETE /api/permissions/project/{id}/{uid}", h.userMiddleware(h.handleRemoveProjectPerm))
 	mux.HandleFunc("GET /api/users", h.userMiddleware(h.handleListUsers))
+
+	// Agent SDK control
+	mux.HandleFunc("POST /api/agent/{type}/sessions", h.userMiddleware(h.handleAgentCreateSession))
+	mux.HandleFunc("GET /api/agent/{type}/sessions", h.userMiddleware(h.handleAgentListSessions))
+	mux.HandleFunc("POST /api/agent/{type}/sessions/{id}/prompt", h.userMiddleware(h.handleAgentSendPrompt))
+	mux.HandleFunc("POST /api/agent/{type}/sessions/{id}/cancel", h.userMiddleware(h.handleAgentCancel))
+	mux.HandleFunc("POST /api/agent/{type}/sessions/{id}/resume", h.userMiddleware(h.handleAgentResume))
+	mux.HandleFunc("PUT /api/agent/{type}/sessions/{id}/rename", h.userMiddleware(h.handleAgentRename))
+	mux.HandleFunc("PUT /api/agent/{type}/sessions/{id}/permissions", h.userMiddleware(h.handleAgentSetPermissions))
+
 
 	mux.HandleFunc("GET /ws", h.hub.HandleWS)
 }
@@ -450,6 +463,128 @@ func (h *Handlers) handlePollInput(w http.ResponseWriter, r *http.Request) {
 	if text := h.sessions.GetPendingInput(key); text != "" {
 		writeJSON(w, http.StatusOK, map[string]string{"text": text})
 		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── Agent SDK control ──
+
+var validPermissionModes = map[string]bool{
+	"": true, "default": true, "acceptEdits": true, "bypassPermissions": true,
+	"plan": true, "readOnly": true, "auto": true,
+}
+
+func isValidPermissionMode(mode string) bool {
+	return validPermissionModes[mode]
+}
+
+func (h *Handlers) agentType(r *http.Request) sdk.AgentType {
+	return sdk.AgentType(r.PathValue("type"))
+}
+
+func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	var req struct {
+		CWD            string   `json:"cwd"`
+		Model          string   `json:"model"`
+		PermissionMode string   `json:"permission_mode"`
+		AllowedTools   []string `json:"allowed_tools"`
+		MaxTurns       int      `json:"max_turns"`
+		Title          string   `json:"title"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	sess, err := h.agentMgr.CreateSession(r.Context(), h.agentType(r), sdk.SessionOptions{
+		CWD: req.CWD, Model: req.Model, PermissionMode: sdk.PermissionMode(req.PermissionMode),
+		AllowedTools: req.AllowedTools, MaxTurns: req.MaxTurns, Title: req.Title,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+	}
+	writeJSON(w, http.StatusCreated, sess)
+}
+
+func (h *Handlers) handleAgentListSessions(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	list, err := h.agentMgr.ListSessions(r.Context(), h.agentType(r), r.URL.Query().Get("dir"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	var req struct{ Prompt string `json:"prompt"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+	}
+	// Stream messages via SSE for REST clients
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+
+	ch, err := h.agentMgr.SendPrompt(r.Context(), h.agentType(r), r.PathValue("id"), req.Prompt)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+	}
+	for msg := range ch {
+		b, _ := json.Marshal(msg)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if msg.IsFinal {
+			break
+		}
+	}
+}
+
+func (h *Handlers) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	h.agentMgr.CancelExecution(r.Context(), h.agentType(r), r.PathValue("id"))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) handleAgentResume(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	sess, err := h.agentMgr.ResumeSession(r.Context(), h.agentType(r), r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (h *Handlers) handleAgentRename(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	var req struct{ Title string `json:"title"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	if err := h.agentMgr.RenameSession(r.Context(), h.agentType(r), r.PathValue("id"), req.Title); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) handleAgentSetPermissions(w http.ResponseWriter, r *http.Request) {
+	if h.agentMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+	}
+	var req struct{ Mode string `json:"mode"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	if err := h.agentMgr.SetPermissionMode(h.agentType(r), r.PathValue("id"), sdk.PermissionMode(req.Mode)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

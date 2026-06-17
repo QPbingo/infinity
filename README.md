@@ -75,7 +75,14 @@ make test-hook SESSION=test-001   # 发送测试事件
 │       ├── claude.go        # Claude Code hook 安装到 ~/.claude/settings.json
 │       ├── codex.go         # Codex hook 安装到 ~/.codex/hooks.json
 │       └── opencode.go      # OpenCode JS Plugin + 轮询注入
-├── web/dashboard.html       # Web 看板（时间线 + Web 输入）
+├── web/dashboard.html       # Web 看板（时间线 + Agent 控制台 + 层级管理）
+├── sdk/
+│   ├── sdk.go               # AgentSDK 统一接口 + 公共类型
+│   ├── claude.go             # ClaudeSDK — CLI 子进程 (--output-format stream-json)
+│   ├── opencode.go           # OpenCodeSDK — ACP JSON-RPC 2.0 (opencode acp)
+│   ├── codex.go              # CodexSDK — CLI 子进程 (codex exec --json)
+│   ├── manager.go            # AgentManager — 多 agent 统一编排
+│   └── execution.go          # ExecutionStore — 执行记录持久化（跨重连恢复）
 ├── Makefile                 # 一键构建 / 启动 / 部署 / 测试
 └── go.mod
 ```
@@ -120,7 +127,75 @@ make test-hook SESSION=test-001   # 发送测试事件
 - 从 Agent PID 沿 PPID 链上溯 ≤10 层
 - 白名单：Ghostty / iTerm2 / Terminal / Warp / kitty / Alacritty / wezterm-gui / VS Code / Cursor / hyper
 
-### 6. Hook 注册
+### 6. Agent SDK — 编程控制 Agent
+
+通过 SDK 可从 Web 端或 API 直接创建/控制 AI 编程 Agent（Claude Code / OpenCode / Codex）。
+
+#### AgentSDK 统一接口（8 个方法）
+
+| 方法 | 说明 |
+|------|------|
+| `CreateSession(ctx, opts)` | 创建会话 |
+| `SendPrompt(ctx, sessionID, prompt)` | 发送 prompt，返回 `<-chan Message` 流式消息 |
+| `ResumeSession(ctx, sessionID)` | 恢复已有 session |
+| `CancelExecution(ctx, sessionID)` | 取消该 session 下所有运行中的执行 |
+| `RenameSession(ctx, sessionID, title)` | 重命名 |
+| `ListSessions(ctx, dir)` | 列出会话 |
+| `SetPermissionMode(sessionID, mode)` | 设置权限模式 |
+| `Close()` | 清理子进程资源 |
+
+#### 三端实现方式
+
+| Agent | 通信方式 | 会话连续性 |
+|-------|---------|-----------|
+| ClaudeSDK | `claude -p "..." --output-format stream-json` | `--resume <id>` |
+| OpenCodeSDK | `opencode acp` JSON-RPC 2.0 stdio | `session/load` |
+| CodexSDK | `codex exec --json "..."` | `--resume <id>` |
+
+#### Agent API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/agent/{type}/sessions` | 创建 agent 会话 |
+| `GET` | `/api/agent/{type}/sessions` | 列出会话 |
+| `POST` | `/api/agent/{type}/sessions/{id}/prompt` | 发送 prompt（SSE 流式返回） |
+| `POST` | `/api/agent/{type}/sessions/{id}/cancel` | 取消该 session 所有执行 |
+| `POST` | `/api/agent/{type}/sessions/{id}/resume` | 恢复会话 |
+| `PUT` | `/api/agent/{type}/sessions/{id}/rename` | 重命名 |
+| `PUT` | `/api/agent/{type}/sessions/{id}/permissions` | 设置权限模式 |
+
+`{type}` = `claude` / `opencode` / `codex`
+
+#### 后台执行 + 重连恢复
+
+Agent 执行与 WebSocket 连接解耦：
+
+```
+用户提交 prompt → daemon 创建 ExecutionRecord → 后台 goroutine 执行 agent CLI
+                                               → 消息写入 ExecutionStore（内存）
+                                               → WS 实时推送（如果连接存活）
+
+用户关闭浏览器 → agent 继续在后台运行
+用户重连浏览器 → WebSocket 发送 agent_executions 快照 → 全部历史执行恢复
+```
+
+- 超时时间可自选：5m / 10m / 30m / 1h / 2h（默认 10m，上限 120m）
+- 执行历史上限 500 条，超出逐出最旧记录
+- 同一 session 支持多个并发执行（各自独立 execID，互不干扰）
+
+#### WebSocket 消息（Agent 控制）
+
+| 方向 | type | 说明 |
+|------|------|------|
+| C→S | `agent_prompt` | 发送 prompt `{agent_type, session_id, prompt, timeout_minutes}` |
+| C→S | `agent_cancel` | 取消执行 `{agent_type, session_id, exec_id}` |
+| S→C | `agent_executions` | 重连时全量执行历史 |
+| S→C | `agent_exec_started` | 新执行开始通知 |
+| S→C | `agent_message` | 流式消息 `{exec_id, msg_type, content, is_final}` |
+| S→C | `agent_session_created` | 自动创建 session 的 ID 返回 |
+| S→C | `agent_error` | 执行错误 |
+
+### 7. Hook 注册
 
 | Agent | 配置文件 | 事件数 |
 |-------|---------|--------|
@@ -159,6 +234,12 @@ make test-hook SESSION=test-001   # 发送测试事件
 | S→C | `snapshot` | 全量 session 快照 |
 | S→C | `delta` | 增量更新 `{session_key, changes}` |
 | S→C | `session_added` | 新 session 出现 |
+| S→C | `hierarchy_snapshot` | 全量层级树（workspace→project→topic→story） |
+| S→C | `hierarchy_updated` | 层级变更增量 |
+| S→C | `agent_executions` | 重连时全量执行历史 |
+| S→C | `agent_message` | Agent 流式消息 `{exec_id, msg_type, content}` |
+| C→S | `agent_prompt` | 发送 prompt 给 agent |
+| C→S | `agent_cancel` | 取消 agent 执行 |
 | C→S | `send_input` | Web 输入 `{session_key, text}` |
 | C→S | `ping` | 心跳 |
 | S→C | `pong` | 心跳回复 |
@@ -276,3 +357,28 @@ handleMessage(msg)
                                  │     └── 无 tools → formatPayloadDisplay() 渲染文本
                                  └── 长文本 (>200字符或>3行) 可折叠
 ```
+
+## 更新日志
+
+### 2026-06-17 — Agent SDK + 多用户权限 + 层级管理
+
+**新增：**
+- `sdk/` 包：统一 AgentSDK 接口，Claude/OpenCode/Codex 三端实现
+- `internal/auth/`：用户注册/登录，bcrypt + Bearer Token
+- `internal/hierarchy/`：Workspace → Project → Topic → Story 4 层管理 + 权限表
+- Agent 控制面板（Web UI）：选择 agent，输入 prompt，流式查看输出
+- 后台执行 + 重连恢复：关闭浏览器不影响 agent 运行，重连后历史执行可见
+- 每个 workspace 自动创建 Inspiration project（含 claude/codex/opencode topic）
+- Session 自动归类：新 session 按 agent_type 归入对应 topic 的 story
+
+**修复：**
+- WebSocket 并发写入保护（writeMu）
+- Hub.Run 广播使用写锁而非读锁
+- SDK sessions map 加互斥锁
+- ExecutionStore 上限 500 条防 OOM
+- active map 改用 execID 为 key，修复同 session 并发发送导致的孤儿进程
+- CLI 非零退出码正确标记 IsFinal
+- OpenCode readLoop 退出时重置 running 状态以支持重连
+- Cancel 取消路径同时调用 ExecutionStore.Cancel
+- ListSessions 加读锁防数据竞争
+- writePump 所有写操作加 writeMu
