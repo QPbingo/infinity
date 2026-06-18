@@ -9,8 +9,9 @@
 | 项 | 选型 | 理由 |
 |----|------|------|
 | 构建工具 | Vite | 快速 HMR，原生 ES Module |
-| 框架 | Vue 3 + TypeScript | 模板语法对原生 HTML 迁移友好，类型安全 |
-| 状态管理 | Pinia | 按领域拆 store，WS 消息集中分发，可测试 |
+| 语言 | TypeScript (vanilla, 无框架) | 类型安全，贴近原 HTML 实现，迁移成本最低 |
+| 状态管理 | 自研轻量 Store (pub/sub) | 按领域拆 store，SSE 消息集中分发，可测试 |
+| 鉴权 | HttpOnly Cookie (浏览器自动携带) | EventSource 不能设头，cookie 最自然；防 XSS |
 | 部署 | 完全独立（静态主机 + Go API 分离） | 真正前后分离 |
 
 ---
@@ -20,56 +21,55 @@
 ```
 web/frontend/
 ├── package.json
-├── vite.config.ts          # proxy /api + /ws → :9101; env 注入 VITE_API_BASE
+├── vite.config.ts          # proxy /api → :9101; env 注入 VITE_API_BASE
 ├── tsconfig.json
 ├── index.html
 └── src/
-    ├── main.ts             # createApp + pinia
-    ├── App.vue             # 根布局 (sidebar + main)
+    ├── main.ts             # 入口: 恢复登录/连SSE/渲染shell
+    ├── config.ts           # API_BASE/SSE_PATH 来自 import.meta.env
     ├── api/
-    │   ├── client.ts       # fetch 封装: baseURL + Bearer 头 + 错误处理
-    │   ├── auth.ts         # register/login/logout
-    │   ├── hierarchy.ts    # workspace/project/topic/story CRUD
+    │   ├── client.ts       # fetch 封装: credentials:include + 错误处理
+    │   ├── auth.ts         # register/login/logout/isAuthed
+    │   ├── hierarchy.ts    # workspace/project/topic/story CRUD (动态ID)
     │   ├── permissions.ts  # permissions + users
-    │   └── types.ts        # 后端类型镜像
-    ├── ws/
-    │   └── manager.ts      # WebSocket 单例: 鉴权/重连/心跳/消息分发
-    ├── stores/
-    │   ├── auth.ts         # token + user, localStorage 持久化
-    │   ├── hierarchy.ts    # 层级树, CRUD 后刷新
-    │   ├── sessions.ts     # WS 推送的 sessions map + delta 合并
-    │   └── agent.ts        # executionHistory + 流式消息
-    ├── composables/
-    │   └── useWebSocket.ts # 连接生命周期 + 消息路由到 stores
-    ├── components/
-    │   ├── AuthOverlay.vue
-    │   ├── SidebarTree.vue
-    │   ├── SessionCard.vue
-    │   ├── Timeline.vue
-    │   ├── ToolGroup.vue
-    │   ├── AgentPanel.vue
-    │   ├── PermissionModal.vue
-    │   └── CreateModal.vue
+    │   └── agent.ts        # sendPrompt(返回exec_id)/cancelExecution/sendInput
+    ├── sse/
+    │   └── manager.ts      # EventSource 单例: 鉴权/重连/保活/401关闭/BroadcastChannel
+    ├── state/
+    │   ├── store.ts        # 轻量 pub/sub 基类
+    │   ├── auth.ts         # user + authed
+    │   ├── hierarchy.ts    # 层级树, 选中态, 展开
+    │   ├── sessions.ts     # sessions map + delta 合并 + 筛选排序
+    │   └── agent.ts        # executionHistory + 流式消息 + 幂等去重
+    ├── ui/
+    │   ├── auth.ts         # renderAuth/doLogin/doRegister/restoreSession
+    │   ├── sidebar.ts      # renderTree/renderProjectNode
+    │   ├── sessionCard.ts  # render/renderSessionCard/sendInput
+    │   ├── timeline.ts     # renderTimeline/toggleToolGroup/Payload/Turn
+    │   ├── agentPanel.ts   # sendPrompt(REST)/cancel/renderExecHistory
+    │   └── modals.ts       # showCreateModal/showPermissionModal/refreshHierarchy
+    ├── utils/
+    │   └── format.ts       # esc/trunc/formatPayload/formatPayloadDisplay/formatTime
     └── styles/
-        └── main.css       # 迁移现有内联 CSS
+        └── main.css       # 从旧 dashboard.html 迁移的样式
 ```
 
 ---
 
 ## 3. 组件迁移映射
 
-现有 `web/dashboard.html` 为单文件全内联实现，按以下映射迁移为 Vue 组件：
+现有 `web/dashboard.html`（已删除）为单文件全内联实现，按以下映射迁移为 TS 模块：
 
-| 现有函数 | → Vue 组件 | 状态来源 |
+| 现有函数 | → TS 模块 | 状态来源 |
 |---------|-----------|---------|
-| `renderAuth` / `doLogin` / `doRegister` | `AuthOverlay.vue` | `auth` store |
-| `renderTree` / `renderProjectNode` | `SidebarTree.vue`（递归子组件） | `hierarchy` + `sessions` store |
-| `renderSessionCard` | `SessionCard.vue` | `sessions` store |
-| `renderTimeline` | `Timeline.vue` + `ToolGroup.vue` | session.turns prop |
-| Agent 面板 (`sendAgentPrompt`/`cancelAgent`) | `AgentPanel.vue` | `agent` store + ws.manager |
-| `showPermissionModal` / `loadPermissions` | `PermissionModal.vue` | api/permissions |
-| `showCreateModal` / `doCreate` | `CreateModal.vue` | api/hierarchy |
-| `handleMessage`（WS 路由） | `useWebSocket` composable | 分发到各 store |
+| `renderAuth` / `doLogin` / `doRegister` | `ui/auth.ts` | `state/auth.ts` |
+| `renderTree` / `renderProjectNode` | `ui/sidebar.ts` | `state/hierarchy.ts` + `state/sessions.ts` |
+| `renderSessionCard` | `ui/sessionCard.ts` | `state/sessions.ts` |
+| `renderTimeline` | `ui/timeline.ts` + 工具组 | session.turns |
+| Agent 面板 (`sendAgentPrompt`/`cancelAgent`) | `ui/agentPanel.ts` | `state/agent.ts` + `api/agent.ts`(REST) |
+| `showPermissionModal` / `loadPermissions` | `ui/modals.ts` | `api/permissions.ts` |
+| `showCreateModal` / `doCreate` | `ui/modals.ts` | `api/hierarchy.ts` |
+| `handleMessage`（WS 路由） | `main.ts handleSSE` | 分发到各 state 模块 |
 | `formatPayload` / `esc` / `trunc` | `utils/format.ts` | 纯函数 |
 
 ---
@@ -77,32 +77,30 @@ web/frontend/
 ## 4. 数据流与状态管理
 
 ```
-WebSocket 消息                  REST 调用
+SSE 事件                         REST 调用
     │                              │
     ▼                              ▼
-ws/manager.ts                  api/client.ts
-    │ 按type分发                   │ 统一 Bearer + baseURL
-    ├─ snapshot/session_added      │
-    │  └▶ stores/sessions.ts       ├─ api/hierarchy.ts ─▶ stores/hierarchy.ts
-    ├─ delta                       ├─ api/auth.ts      ─▶ stores/auth.ts
-    │  └▶ stores/sessions.ts       └─ api/permissions.ts
-    ├─ hierarchy_snapshot/updated
-    │  └▶ stores/hierarchy.ts
+sse/manager.ts                  api/client.ts (credentials:include)
+    │ 按type分发                   │ cookie 自动携带
+    ├─ snapshot/session_added/delta│
+    │  └▶ state/sessions.ts       ├─ api/hierarchy.ts ─▶ state/hierarchy.ts
+    ├─ hierarchy_snapshot/updated │ ├─ api/auth.ts ─▶ state/auth.ts
+    │  └▶ state/hierarchy.ts      ├─ api/permissions.ts
     └─ agent_executions/exec_started/agent_message/...
-       └▶ stores/agent.ts
-                │
-                ▼
-           Vue 组件 (computed 订阅 store, 自动响应式渲染)
+       └▶ state/agent.ts
+                 │
+                 ▼
+            ui 模块 (订阅 state store, 自动重渲染)
 ```
 
-### Pinia stores 职责
+### State Store 职责
 
-| Store | 状态 | Actions | 来源 |
-|-------|------|---------|------|
-| `auth` | token, user | login, register, logout, restoreFromStorage | api/auth.ts + localStorage |
-| `hierarchy` | HierarchyTree, selectedWorkspaceId/TopicId/StoryId | refresh, createWorkspace/Project/Topic/Story, editStory, deleteStory | api/hierarchy.ts + WS hierarchy_* |
-| `sessions` | `Map<session_key, Session>`, currentFilter | applySnapshot, addSession, applyDelta, filter getter | WS snapshot/session_added/delta |
-| `agent` | `executionHistory[]`, currentExecId | sendPrompt, cancel, onExecStarted, onMessage, onExecutions | ws.manager + WS agent_* |
+| Store | 状态 | 来源 |
+|-------|------|------|
+| `auth` | user, authed | api/auth.ts + cookie (浏览器管理) |
+| `hierarchy` | HierarchyTree, selectedWorkspaceId/TopicId/StoryId, expandedNodes | SSE hierarchy_* + api/hierarchy.ts |
+| `sessions` | `Record<session_key, Session>`, currentFilter, expanded* | SSE snapshot/session_added/delta |
+| `agent` | `Execution[]`, currentExecId | SSE agent_* + api/agent.ts (REST 发命令) |
 
 ---
 
@@ -112,16 +110,16 @@ ws/manager.ts                  api/client.ts
 ```
 Vite dev server (:5173) ──proxy──▶ Go daemon (:9101)
   /api/*  → 127.0.0.1:9101
-  /ws     → 127.0.0.1:9101 (WebSocket proxy)
-  免 CORS（同源经代理）
+  免 CORS（同源经代理），cookie SameSite=Lax
 ```
 
 ### 生产态
 ```
-静态主机 (Nginx / CDN) ──CORS──▶ Go daemon (:9101, 纯 API + WS)
+静态主机 (Nginx / CDN) ──CORS──▶ Go daemon (:9101, 纯 API + SSE)
   前端构建产物 (dist/) 独立部署
   baseURL 由环境变量 VITE_API_BASE 注入
-  Go 后端移除 GET / 静态路由, 新增 CORS 中间件
+  cookie SameSite=None; Secure (跨域 HTTPS)
+  --cors-origins=https://app.yourhost.com
 ```
 
 ---

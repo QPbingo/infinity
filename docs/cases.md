@@ -8,13 +8,13 @@
 
 | 标注 | 含义 | 框架 |
 |------|------|------|
-| `[B]` | 后端 Go 测试 | `make test`（Go testing） |
-| `[F]` | 前端测试 | Vitest + @vue/test-utils |
+| `[B]` | 后端 Go 测试 | `go test`（Go testing） |
+| `[F]` | 前端测试 | Vitest + jsdom |
 | `[BF]` | 双层均需覆盖 | 后端验证契约，前端验证状态处理 |
 
 **原则：**
-- `[B]` 验证 HTTP/WS 契约与权限边界。
-- `[F]` 验证 Pinia store 对 WS 消息的处理和 api/client 鉴权注入。
+- `[B]` 验证 HTTP/SSE 契约与权限边界。
+- `[F]` 验证 TS state 模块对 SSE 消息的处理和 api/client 鉴权注入。
 - `[BF]` 两层都要测：后端保证语义，前端保证状态正确。
 
 ---
@@ -24,9 +24,8 @@
 | Actor | 凭证 | 可访问范围 |
 |-------|------|-----------|
 | A1 访客 | 无 | 仅 `POST /api/auth/{register,login}` |
-| A2 认证用户 | Bearer token | 所有 userMiddleware + 旧 authMiddleware 路由 |
+| A2 认证用户 | HttpOnly Cookie（或 Bearer 兼容） | 所有 WebAuth 组路由 + SSE |
 | A3 Agent 插件 | X-Daemon-Token | `/api/poll-input`、`/api/sessions/*`、`/health` |
-| A4 外部 API 调用者 | Bearer token | REST `/api/agent/*`（SSE 流） |
 
 A2 按资源权限运行时细分：
 
@@ -52,30 +51,32 @@ A2 按资源权限运行时细分：
 
 | 模块 | ID 前缀 | 用例数 | 阶段 | 关键场景 |
 |------|---------|--------|------|---------|
-| 认证 | AUTH | 13 | P1 | 注册/登录/登出/token失效/WS鉴权/持久化 |
-| 层级管理 | HIER | 16 | P2 | 自动授权/权限不继承/PA删topic/硬编码ID修复 |
-| 权限管理 | PERM | 8 | P2 | 授权/删除/列表/Viewer不能授权 |
-| Session 推送 | SESS | 8 | P3 | snapshot替换/delta幂等/并发安全/筛选排序 |
-| 时间线渲染 | TL | 7 | P3 | 倒序/默认展开/工具组折叠/去敏感字段 |
-| Web 输入注入 | IN | 7 | P4 | 入队/取走即清/插件鉴权/空文本不发 |
-| Agent 控制 | AG | 18 | P4 | 自动创建session/流式消息/关浏览器继续/重连恢复 |
-| WS 连接管理 | WS | 7 | P1/P5 | 3s重连/全量恢复/auth_error触发logout/心跳 |
-| 前后分离部署 | DEP | 8 | P0/P5 | CORS预检/拒绝非允许源/baseURL注入/移除静态路由 |
+| 前后分离部署 | DEP | 8 | P0/P2/P5 | CORS预检/拒绝非允许源/baseURL注入/移除静态路由/SSE跨域 |
+| 鉴权中间件 | AUTH-MID | 4 | P0 | WebAuth分组统一鉴权/MachineAuth机器端点/公开组/注入user |
+| 认证 | AUTH | 16 | P1/P2 | 注册/登录/登出/Cookie下发/HttpOnly/续期/SSE鉴权/持久化 |
+| SSE 连接 | SSE | 10 | P0/P2 | 初始推送/写入互斥/重连时序/保活心跳/401主动关闭 |
+| BroadcastChannel | BC | 4 | P2 | 多标签共享/leader选举/心跳/夺权 |
+| 层级管理 | HIER | 16 | P4 | 自动授权/权限不继承/PA删topic/硬编码ID修复 |
+| 权限管理 | PERM | 8 | P4 | 授权/删除/列表/Viewer不能授权 |
+| Session 推送 | SESS | 8 | P4 | snapshot替换/delta幂等/并发安全/筛选排序 |
+| 时间线渲染 | TL | 7 | P4 | 倒序/默认展开/工具组折叠/去敏感字段 |
+| Web 输入注入 | IN | 7 | P3 | 入队/取走即清/插件鉴权/空文本不发/REST |
+| Agent 控制 | AG | 19 | P3 | 自动创建session/流式消息/关浏览器继续/重连恢复/跨客户端广播/REST返回exec_id |
 
-**合计：70+ 用例**
+**合计：107 用例**
 
 ---
 
 ## 5. 实施阶段与用例映射
 
-| 阶段 | 内容 | 对应用例 |
-|------|------|---------|
-| P0 | 后端 CORS + 移除静态路由 + `--cors-origins` | DEP-01,02,04,06,07 |
-| P1 | 脚手架 + api/client + ws/manager + auth store | AUTH-01~13, WS-01~07 |
-| P2 | hierarchy store + SidebarTree + CreateModal + PermissionModal | HIER-01~16, PERM-01~08 |
-| P3 | sessions store + SessionCard + Timeline + ToolGroup | SESS-01~08, TL-01~07 |
-| P4 | agent store + AgentPanel + 执行历史 | AG-01~18, IN-01~07 |
-| P5 | 对等验证 + 删除旧 dashboard + Makefile 集成 | 全部用例回归 + DEP-03,05,08 |
+| 阶段 | 子任务 | 内容 | 对应用例 |
+|------|--------|------|---------|
+| P0 | T002-1 | 后端 CORS + 移除静态路由 + SSE 地基 + 鉴权独立化 | DEP-01,02,04,06,07; AUTH-MID-01~04; SSE-01~05 |
+| P1 | T002-2 | Cookie 鉴权 + 服务端 token 续期 | AUTH-01~13 |
+| P2 | T002-3 | 前端脚手架 + 登录 + SSE 闭环 + BroadcastChannel | AUTH-14~16; SSE-F01~05; BC-01~04; DEP-03,05 |
+| P3 | T002-4 | REST 命令 + Agent 执行流（全局 SSE 广播） | AG-01~18, AG-IDEM; IN-01~07 |
+| P4 | T002-5 | 层级 + 会话卡片 + 时间线（修硬编码 ID） | HIER-01~16; PERM-01~08; SESS-01~08; TL-01~07 |
+| P5 | T002-6 | 对等验证 + 删除旧 dashboard + Makefile + 文档 | 全部用例回归 + DEP-08 |
 
 **建议**：每阶段先写对应 `[F]`/`[B]` 测试再实现（TDD），阶段末跑全量回归。
 
@@ -84,7 +85,7 @@ A2 按资源权限运行时细分：
 ## 6. 关键状态机（测试依据）
 
 - **Session**：`active ↔ idle → stopped/disappeared/error`
-- **WebSocket（前端）**：`disconnected → connecting → auth_pending → connected → disconnected(3s重连)`
+- **SSE 连接（前端）**：`disconnected → connecting → connected → disconnected(自动重连)` + 401→`closed+登录框`
 - **Execution**：`created → running → completed/error/cancelled`
 
 ---
@@ -95,10 +96,13 @@ A2 按资源权限运行时细分：
 |------|---------|
 | 后端权限检查（checkWSAdmin/checkProjAdmin） | 100% 分支（所有 403 路径） |
 | 后端 CORS 中间件 | 100% 分支（允许/拒绝/预检） |
-| 前端 stores WS 消息处理 | 100% 消息 type 分支 |
-| 前端 api/client 鉴权头注入 | 100%（有 token/无 token/错误） |
+| 后端 WebAuth/MachineAuth | 100% 分支（cookie/Bearer/daemon-token/无凭证） |
+| 后端 SSEHub 写入互斥 | 100%（并发不交错） |
+| 前端 state 模块 SSE 消息处理 | 100% 消息 type 分支 |
+| 前端 api/client credentials 注入 | 100%（有/无 cookie） |
 | 前端 sessions delta 合并 | 100%（幂等、字段独立） |
 | 前端 agent 状态机 | 100%（running→completed/error/cancelled） |
+| 前端 BroadcastChannel leader 选举 | 100%（选举/心跳/夺权） |
 
 未达 100% 的需在 PR 中说明原因。
 
@@ -107,20 +111,22 @@ A2 按资源权限运行时细分：
 ## 8. 测试环境
 
 ### 后端 `[B]`
-- 复用现有 `make test`。
+- 扩展 `make test` 覆盖 `./internal/session/`、`./internal/server/`、`./internal/auth/`。
 - 权限用例需多用户 fixture：注册 A/B/C 三用户，A 建 ws1+proj1，C 被授 proj1 的 pa。
-- WS 用例用 `gorilla/websocket` dialer 拨号验证消息流。
+- SSE 用例用 `httptest.NewServer` + 客户端读 `text/event-stream` 验证消息流。
 - CORS 用例用 `httptest.NewRecorder` + `OPTIONS` 请求验证响应头。
+- cookie 用例用 `httptest.NewRecorder` 检查 `Set-Cookie` 头。
 
 ### 前端 `[F]`
 - Vitest + jsdom 环境。
-- store 测试：mock `api/client` 和 `ws/manager`，验证 action 调用后状态变化。
-- 组件测试：@vue/test-utils mount 组件，断言渲染输出。
-- localStorage 测试：jsdom 提供 localStorage，测试持久化与恢复。
+- state 模块测试：mock `api/client` 和 `sse/manager`，验证调用后状态变化。
+- SSE 消息处理测试：构造消息 JSON 喂给 state 模块，断言状态。
+- BroadcastChannel 测试：mock `BroadcastChannel` API。
+- cookie 测试：jsdom 提供 `document.cookie`（HttpOnly cookie 需 mock 不可读语义）。
 
 ---
 
 ## 详细文档
 
-- 完整测试用例（70+ 条）：[test-cases.md](./test-cases.md)
-- 执行方案 + 时序图 + 状态图：[frontend-separation-plan.md](./frontend-separation-plan.md)
+- 完整测试用例（107 条）：[test-cases.md](./test-cases.md)
+- 任务清单：[task/task.json](./task/task.json)

@@ -1,32 +1,145 @@
 {
-  "task_id": "T001",
-  "title": "任务标题（示例）",
-  "user_requirement": "在此填写用户的原始需求全文。",
+  "task_id": "T002",
+  "title": "前后端完全分离架构改造（SSE + Cookie 鉴权 + 原生 TS 前端工程）",
+  "user_requirement": "将当前代码架构改为完全前后分离模式，前后端交互只有接口调度关系；移除 WebSocket 换用 SSE+REST；HttpOnly Cookie 鉴权；前端拆为独立 Vite(vanilla TS) 工程；所有 web API 先经鉴权中间件再访问业务；数据不同步/错漏不可接受。",
   "created_at": "2026-06-18T10:00:00",
-  "status": "pending",
+  "status": "completed",
   "subtasks": [
     {
-      "id": "T001-1",
-      "title": "子任务标题",
-      "description": "子任务详细描述",
-      "status": "pending",
+      "id": "T002-1",
+      "title": "P0 后端纯 API 化 + SSE 地基 + 鉴权独立化",
+      "description": "移除 GET / 静态托管（handlers.go serveDashboard + 路由）；新建 internal/server/cors.go CORS 中间件 + --cors-origins 参数（默认 http://localhost:5173, Allow-Credentials:true, 回显 origin）；新建 internal/server/sse.go SSEHub 替代 WSHub（每客户端 sync.Mutex 保护 ResponseWriter 写入，约束 A；连接时先 register 再发 snapshot+hierarchy+executions，约束 B）；删除 internal/server/websocket.go 与 gorilla/websocket 依赖；SetNotify/SetHierarchyNotify 指向 SSEHub；鉴权中间件独立到 internal/auth/middleware.go（WebAuth cookie+Bearer 注入 user / MachineAuth 仅 X-Daemon-Token），handlers.go 路由改分组注册（公开组/机器组/web 组），删除 handlers.go 的 authMiddleware/userMiddleware。",
+      "status": "completed",
       "acceptance_criteria": [
-        "验收条件1",
-        "验收条件2"
+        "GET http://127.0.0.1:9101/ 返回 404",
+        "go build ./... 通过，go test ./internal/session/ 通过",
+        "go.mod 不再含 github.com/gorilla/websocket",
+        "internal/server/websocket.go 文件已删除",
+        "internal/auth/middleware.go 提供 WebAuth/MachineAuth，handlers.go 不再含 authMiddleware/userMiddleware",
+        "handlers.go 路由按公开组/机器组/web 组分组注册，web 组统一经 WebAuth",
+        "cmd/daemon/main.go 含 --cors-origins 参数，默认 http://localhost:5173",
+        "SSE 连接 GET /api/events/stream（带有效 cookie）依次收到 snapshot+hierarchy_snapshot+agent_executions",
+        "SSE 客户端并发写入（snapshot + delta 同时）不产生字节交错（约束 A 验证）",
+        "SSE 重连时序：先加入广播组再发 snapshot，期间产生的 delta 不丢失（约束 B 验证）"
       ],
       "dependencies": [],
       "started_at": "",
       "completed_at": ""
     },
     {
-      "id": "T001-2",
-      "title": "子任务标题",
-      "description": "子任务详细描述",
-      "status": "pending",
+      "id": "T002-2",
+      "title": "P1 Cookie 鉴权 + 服务端 token 同步续期",
+      "description": "handleRegister/handleLogin 成功后 Set-Cookie（HttpOnly, persistent Max-Age=7天=604800, SameSite 按环境, Secure 按环境）；WebAuth 读 cookie 鉴权（cookie 优先 + Bearer 兼容）；handleLogout 清 cookie 并校验 token 有效性后 revoke；服务端 token 续期：WebAuth 鉴权成功且 token 剩余<1天时 UPDATE auth_tokens.expires_at=now+7天 + 重发 Set-Cookie。修复服务端 token 24h 硬过期与 cookie 7天不匹配问题。",
+      "status": "completed",
       "acceptance_criteria": [
-        "验收条件1"
+        "登录响应含 Set-Cookie: session_token=...; HttpOnly; Max-Age=604800 头",
+        "cookie HttpOnly 标志为 true（JS document.cookie 读不到 session_token）",
+        "带 cookie 访问 web 组路由（无 Bearer）→ 200，auth.GetUser(r) 返回正确 user",
+        "不带 cookie 且不带 Bearer 访问 web 组 → 401",
+        "logout 响应含 Set-Cookie: session_token=; Max-Age=0（清除），且旧 token 被 revoke",
+        "服务端 token 剩余<1天时，任意 web 请求后 expires_at 被刷新为 now+7天，响应含新 Set-Cookie",
+        "cookie 跨子域生产模式：SameSite=None; Secure（HTTPS 环境）",
+        "EventSource 连 SSE 自动带 cookie，鉴权通过收到 snapshot"
       ],
-      "dependencies": ["T001-1"],
+      "dependencies": [
+        "T002-1"
+      ],
+      "started_at": "",
+      "completed_at": ""
+    },
+    {
+      "id": "T002-3",
+      "title": "P2 前端脚手架 + 登录 + SSE 闭环 + BroadcastChannel",
+      "description": "web/frontend/ Vite vanilla TS 工程；src/config.ts(API_BASE/WS_BASE 来自 import.meta.env)；src/api/client.ts(fetch 封装 credentials:include)；src/sse/manager.ts(EventSource + 25s 保活心跳 + 60s 无消息超时断连 + 401 主动 close 弹登录，约束 D)；src/state/auth.ts + src/ui/auth.ts 登录/登出闭环；BroadcastChannel 多标签页共享 SSE（leader 选举，tab1 持有 SSE 广播给 tab2，tab1 关闭 tab2 选举为新 leader 重连）。",
+      "status": "completed",
+      "acceptance_criteria": [
+        "web/frontend/package.json 存在，npm install 成功",
+        "npm run dev 启动 Vite :5173，能加载页面",
+        "vite.config.ts 含 /api + /api/events/stream proxy 到 :9101",
+        "登录页输入凭证 → 调 POST /api/auth/login → cookie 写入 → 进主界面",
+        "登录后 SSE 自动连接，收到 snapshot 并渲染（即使空 sessions 也无报错）",
+        "断开后端：SSE onerror，60s 内判定断连，后端恢复后 EventSource 自动重连",
+        "SSE 收 401（cookie 过期）：主动 close() + 弹登录框（约束 D）",
+        "多标签页：tab1 持有 SSE，tab2 通过 BroadcastChannel 收到相同消息，tab1 关闭后 tab2 选举为新 leader 重连 SSE",
+        "logout 清除本地状态 + SSE 关闭 + 弹登录页",
+        "credentials:include 生效：fetch 跨域请求自动带 cookie"
+      ],
+      "dependencies": [
+        "T002-2"
+      ],
+      "started_at": "",
+      "completed_at": ""
+    },
+    {
+      "id": "T002-4",
+      "title": "P3 REST 命令 + Agent 执行流（全局 SSE 广播）",
+      "description": "改造 handleAgentSendPrompt 为「启动执行 + ExecutionStore.Create + 经 SSEHub 全局广播 agent_exec_started/agent_message/agent_error/agent_cancelled」，REST 响应返回 {exec_id, session_id}（约束 C）；新增 POST /api/sessions/{key}/input 路由替代 WS send_input（调 HandleWebInput）；前端 state/agent.ts + ui/agentPanel.ts 走 REST 发命令 + SSE 收流；exec_id 幂等去重；跨客户端实时广播（所有看板看实时流，增强）。",
+      "status": "completed",
+      "acceptance_criteria": [
+        "POST /api/agent/{type}/sessions/{id}/prompt 响应体含 exec_id + session_id（约束 C）",
+        "发起 prompt 后，SSE 收到 agent_exec_started，exec_id 与 REST 响应一致",
+        "执行中 SSE 收到多条 agent_message，最后一条 is_final=true",
+        "agent_error 标记 execution 为 error",
+        "关闭前端（SSE 断），agent 后台继续，ExecutionStore.Complete 执行",
+        "重连 SSE 收到 agent_executions 含已完成记录（历史恢复）",
+        "POST /api/agent/{type}/sessions/{id}/cancel → 子进程 kill + SSE agent_cancelled",
+        "timeout_minutes 上限 120",
+        "ExecutionStore 上限 500，超限逐出最旧",
+        "A 看板发 prompt，B 看板（同 SSE）也收到 agent_exec_started + agent_message（跨客户端广播）",
+        "POST /api/sessions/{key}/input → HandleWebInput + SSE 推 delta；GET /api/poll-input 仍能取走（agent 侧不变）",
+        "前端重复收 agent_exec_started（同 exec_id）不双插（幂等去重）",
+        "空 session_id 发 prompt → 自动创建 session + agent_session_created SSE + 前端回填 sid"
+      ],
+      "dependencies": [
+        "T002-3"
+      ],
+      "started_at": "",
+      "completed_at": ""
+    },
+    {
+      "id": "T002-5",
+      "title": "P4 层级 + 会话卡片 + 时间线（修硬编码 ID）",
+      "description": "state/hierarchy.ts + state/sessions.ts；ui/sidebar.ts + ui/modals.ts + ui/sessionCard.ts + ui/timeline.ts + ui/filters.ts；api/hierarchy.ts + api/permissions.ts；修复 createStory/doCreate('topic') 硬编码 wid=1,pid=1（改为动态传入 selectedWorkspaceId 与当前 project id）；层级 CRUD 保持 refreshHierarchy() 现状（不广播，零风险）；时间线 payload 去敏感字段（daemon_token/_role）。",
+      "status": "completed",
+      "acceptance_criteria": [
+        "侧栏树渲染 hierarchy，workspace/project/topic/story 层级正确",
+        "选中 topic → 按 story session_key 过滤 sessions；选中 story → 单 session 视图",
+        "workspace/project/topic/story 增删改全可用，无写死 ID（HIER-12 修复）",
+        "createStory(topicId) 请求路径含动态 tid，不含写死 1",
+        "doCreate('topic', parentId) 请求路径含动态 wid+pid",
+        "权限弹窗：列出用户、授权、删除、Viewer 不能授权",
+        "CRUD 后调 refreshHierarchy() 刷新本客户端视图（保持现状，不依赖广播）",
+        "session 卡片：展开/折叠互不影响，按 status 筛选，按 last_event_time_ms 排序",
+        "时间线：Turn 倒序、最新默认展开、工具组折叠、payload 去敏感字段（daemon_token/_role）",
+        "SSE delta 合并幂等：连续 delta 不同字段都更新，无中间态泄漏",
+        "sendInput（REST）后 SSE delta 到达，user_input 立即显示"
+      ],
+      "dependencies": [
+        "T002-4"
+      ],
+      "started_at": "",
+      "completed_at": ""
+    },
+    {
+      "id": "T002-6",
+      "title": "P5 对等验证 + 清理 + 文档更新",
+      "description": "全功能回归对比旧 dashboard.html；删除 web/dashboard.html；Makefile 集成 frontend/dev-frontend/web 目标（DASHBOARD 改前端地址）；更新 docs/frontend.md（Vue→vanilla-TS/SSE/Cookie 实况）、docs/backend.md（移除 WS、加 SSE/CORS/Cookie）、docs/cases.md + docs/test-cases.md（重写为 SSE/Cookie 用例）；生产部署模拟验证。",
+      "status": "completed",
+      "acceptance_criteria": [
+        "test-cases.md 全用例通过（[B] 用 go test，[F] 用 vitest）",
+        "web/dashboard.html 已删除",
+        "make build && make frontend 一键产出可部署产物（daemon 二进制 + 前端 dist/）",
+        "make dev-frontend 启动 Vite dev，make dev 启动 daemon，两者协同正常",
+        "make web 改为打开前端 dev 或 dist",
+        "docs/frontend.md 描述与实际实现一致（vanilla TS + SSE + Cookie，非 Vue + WS）",
+        "docs/backend.md 移除 WS 章节，加 SSE/CORS/Cookie 章节",
+        "docs/cases.md + docs/test-cases.md 用例与实际一致（SSE/Cookie，无 WS）",
+        "旧 dashboard 所有功能在新前端均有对等实现，无功能缺失",
+        "生产部署模拟：dist/ 部署到静态主机 + daemon --cors-origins 配置 → 跨域 cookie 鉴权 + SSE 全功能正常"
+      ],
+      "dependencies": [
+        "T002-5"
+      ],
       "started_at": "",
       "completed_at": ""
     }

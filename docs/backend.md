@@ -7,11 +7,11 @@
 ## 1. 架构总览
 
 ```
-Agent Hook ──agent-monitor-hook──▶ events.jsonl ──fsnotify──▶ Daemon ──WS──▶ 浏览器 (:9101)
-                                      ▲
-               PID Scanner (15s gopsutil) ──CPU/Memory/死亡检测──┘
-                                      ▲
-          Web 输入 ──WS──▶ Daemon ──poll──▶ OpenCode 插件 ──SDK──▶ Agent
+Agent Hook ──agent-monitor-hook──▶ events.jsonl ──fsnotify──▶ Daemon ──SSE──▶ 浏览器 (:9101)
+                                       ▲
+                PID Scanner (15s gopsutil) ──CPU/Memory/死亡检测──┘
+                                       ▲
+           Web 输入 ──REST──▶ Daemon ──poll──▶ OpenCode 插件 ──SDK──▶ Agent
 ```
 
 **核心原则：**
@@ -49,8 +49,8 @@ Agent Hook ──agent-monitor-hook──▶ events.jsonl ──fsnotify──�
 | PID Scanner | 15s gopsutil 扫描，更新 CPU/Memory，检测死亡/静默 | `internal/scanner/scanner.go` |
 | Terminal Detector | PPID 链上溯 (≤10层) 识别终端 | `internal/scanner/terminal.go` |
 | Session Recovery | 启动时扫描 transcript JSONL 恢复最近 24h session | `internal/session/recovery.go` |
-| WebSocket Hub | 管理 WS 连接，新连接推 Snapshot，实时广播 Delta | `internal/server/websocket.go` |
-| AuthStore | 用户 CRUD、bcrypt 认证、Bearer Token | `internal/auth/` |
+| SSE Hub | 管理 SSE 连接，新连接推 Snapshot，实时广播 Delta/Agent 事件 | `internal/server/sse.go` |
+| AuthStore | 用户 CRUD、bcrypt 认证、Cookie/Bearer Token + 自动续期 | `internal/auth/` |
 | HierarchyStore | 4 层 CRUD + 权限表 | `internal/hierarchy/` |
 | AgentManager | 多 agent 统一编排（Claude/OpenCode/Codex SDK） | `sdk/manager.go` |
 | ExecutionStore | 执行记录持久化（跨重连恢复，上限 500） | `sdk/execution.go` |
@@ -88,38 +88,45 @@ CREATE TABLE daemon_sessions (
 
 ## 4. HTTP API 概览
 
-监听 `127.0.0.1:9101`。
+监听 `127.0.0.1:9101`。鉴权分三组（见 `internal/auth/middleware.go`）：
 
-| 模块 | 方法 | 路径 | 鉴权 |
+| 组 | 方法 | 路径 | 鉴权 |
 |------|------|------|------|
-| 认证 | POST | `/api/auth/{register,login,logout}` | register/login 无，logout Bearer |
-| 层级 | GET/POST/PUT/DELETE | `/api/workspaces*`, `/api/stories/{id}` | Bearer |
-| 权限 | GET/PUT/DELETE | `/api/permissions/{workspace,project}/{id}` | Bearer |
-| Session 查询 | GET | `/api/sessions`, `/api/sessions/{key}` | X-Daemon-Token 或 Bearer |
-| 插件轮询 | GET | `/api/poll-input` | X-Daemon-Token |
-| Agent SDK | POST/GET/PUT | `/api/agent/{type}/sessions*` | Bearer |
-| 健康检查 | GET | `/health` | X-Daemon-Token |
-| WebSocket | GET | `/ws` | 首条消息 auth |
+| 公开 | POST | `/api/auth/{register,login}` | 无 |
+| 机器 | GET | `/health`, `/api/poll-input`, `/api/sessions/{key}/pending-input` | X-Daemon-Token (MachineAuth) |
+| Web | GET/POST/PUT/DELETE | `/api/workspaces*`, `/api/stories/{id}`, `/api/permissions/*`, `/api/users`, `/api/sessions*`, `/api/agent/*` | HttpOnly Cookie 或 Bearer (WebAuth) |
+| Web | POST | `/api/sessions/{key}/input` | Cookie/Bearer |
+| Web | GET | `/api/events/stream` (SSE) | Cookie/Bearer |
+| Web | POST | `/api/auth/logout` | Cookie/Bearer |
+
+CORS 中间件（`internal/server/cors.go`）：`--cors-origins` 白名单回显 origin，`Allow-Credentials: true`（cookie 模式禁止 `*`）。
 
 ---
 
-## 5. WebSocket 协议概览
+## 5. SSE 协议概览
 
-**连接**：`ws(s)://host/ws`，首条消息必须为 `{"type":"auth","token":"<bearer>"}`。
+**连接**：`GET /api/events/stream`，带 HttpOnly Cookie 鉴权（EventSource 自动携带）。
 
-| 方向 | type | 说明 |
-|------|------|------|
-| C→S | `auth` | 鉴权 |
-| S→C | `auth_ok`/`auth_error` | 鉴权结果 |
-| S→C | `snapshot` | 全量 session 快照 |
-| S→C | `delta` | 增量更新 `{session_key, changes}` |
-| S→C | `session_added` | 新 session |
-| S→C | `hierarchy_snapshot`/`hierarchy_updated` | 层级树 |
-| S→C | `agent_executions` | 重连时全量执行历史 |
-| S→C | `agent_exec_started`/`agent_message`/`agent_error`/`agent_cancelled` | Agent 执行流 |
-| C→S | `send_input` | Web 输入注入 |
-| C→S | `agent_prompt`/`agent_cancel` | Agent 控制 |
-| C→S | `ping` / S→C `pong` | 心跳 |
+连接后依次收到：
+1. `snapshot` — 全量 session 快照
+2. `hierarchy_snapshot` — 层级树
+3. `agent_executions` — 执行历史（重连恢复）
+
+之后持续推送增量：
+
+| type | 说明 |
+|------|------|
+| `delta` | 增量更新 `{session_key, changes}` |
+| `session_added` | 新 session |
+| `hierarchy_updated` | 层级树更新（session 自动挂载时） |
+| `agent_exec_started` | Agent 执行启动（全局广播） |
+| `agent_session_created` | 自动创建 session（全局广播） |
+| `agent_message` | Agent 流式消息（全局广播） |
+| `agent_error` / `agent_cancelled` | 执行错误/取消 |
+
+保活：服务端每 25s 推 `: ping` SSE 注释行；客户端 60s 无消息判定断连重连。
+
+**关键约束**：每客户端 `sync.Mutex` 保护写入（约束 A），连接先 register 再发 snapshot（约束 B，delta 不丢）。
 
 ---
 
@@ -161,7 +168,7 @@ disappeared/stopped ──Hook重启──▶ active
 | `--listen` | `127.0.0.1:9101` | HTTP 监听 |
 | `--scan-interval` | `15` | PID 扫描间隔(秒) |
 | `--user-id` | `"local"` | 用户标识 |
-| `--cors-origins` | `*` | 允许的 CORS 源（逗号分隔） |
+| `--cors-origins` | `http://localhost:5173` | 允许的 CORS 源（逗号分隔，前端源） |
 
 ---
 
@@ -173,16 +180,16 @@ disappeared/stopped ──Hook重启──▶ active
 │   ├── hook/main.go         # agent-monitor-hook
 │   └── setup/main.go        # 初始化 + hook 注册 CLI
 ├── internal/
-│   ├── auth/                # 用户/Token/中间件
+│   ├── auth/                # 用户/Token/Cookie/WebAuth/MachineAuth 中间件
 │   ├── hierarchy/           # 4层CRUD + 权限
 │   ├── hook/                # EventWatcher
 │   ├── session/             # SessionManager + SQLite + Recovery
 │   ├── scanner/             # PID Scanner + Terminal Detector
-│   ├── server/              # HTTP + WebSocket Hub
+│   ├── server/              # HTTP + SSE Hub + CORS
 │   ├── installer/           # 各 Agent hook 安装
 │   └── token/               # Daemon Token
 ├── sdk/                     # Agent SDK (Claude/OpenCode/Codex)
-└── web/dashboard.html       # 旧版看板（分离后删除）
+└── web/frontend/            # 前端独立工程 (Vite + vanilla TS)
 ```
 
 ---
