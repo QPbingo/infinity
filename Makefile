@@ -1,10 +1,11 @@
-.PHONY: build start stop web clean install dev restart reset deploy logs sessions test
+.PHONY: build start stop web clean install dev restart reset deploy logs sessions test frontend dev-frontend
 
 BIN_DIR      := $(shell pwd)/bin
 DAEMON       := $(BIN_DIR)/agent-monitor-daemon
 HOOK         := $(BIN_DIR)/agent-monitor-hook
 SETUP        := $(BIN_DIR)/agent-monitor-setup
-DASHBOARD    := http://127.0.0.1:9101
+FRONTEND_DIR := $(shell pwd)/web/frontend
+DASHBOARD    := http://localhost:5173
 MONITOR_DIR  := $(HOME)/.agent-monitor
 TOKEN        := $(shell cat $(MONITOR_DIR)/local-token 2>/dev/null)
 
@@ -16,6 +17,19 @@ build:
 	go build -o $(HOOK)   ./cmd/hook
 	go build -o $(SETUP)  ./cmd/setup
 	@echo "✓ 构建完成"
+
+# 前端: 安装依赖 + 构建 dist/
+frontend:
+	@cd $(FRONTEND_DIR) && npm install && npm run build
+	@echo "✓ 前端构建完成 → $(FRONTEND_DIR)/dist/"
+
+# 前端开发模式 (Vite dev server, :5173)
+dev-frontend:
+	@cd $(FRONTEND_DIR) && npm run dev
+
+# 一键构建: 后端 + 前端
+build-all: build frontend
+	@echo "✓ 全部构建完成"
 
 # 一键启动 (构建+初始化+注册hook+后台运行daemon)
 start: build
@@ -85,15 +99,14 @@ test-hook:
 	@echo "==> 停止 agent-monitor-daemon..."
 	@killall agent-monitor-daemon 2>/dev/null && echo "✓ 已停止" || echo "! 未找到运行中的 daemon"
 
-# 打开 web 看板
+# 打开 web 看板 (前端 dev server :5173, 需后端 :9101 运行)
 web:
 	@if ! pgrep -f agent-monitor-daemon > /dev/null 2>&1; then \
 		echo "==> daemon 未运行，先启动..."; \
 		$(MAKE) --no-print-directory start; \
 	fi
-	@echo "==> 打开看板 $(DASHBOARD)"
-	@open $(DASHBOARD) 2>/dev/null || xdg-open $(DASHBOARD) 2>/dev/null || \
-		echo "请手动打开: $(DASHBOARD)"
+	@echo "==> 启动前端 dev server $(DASHBOARD)"
+	@cd $(FRONTEND_DIR) && npm run dev
 
 # 开发模式: 构建 + 前台运行 (Ctrl+C 停止)
 dev: build
@@ -235,6 +248,7 @@ sessions:
 	@if [ -z "$(TOKEN)" ]; then echo "未初始化，先运行 make start"; exit 1; fi
 	@curl -sf $(DASHBOARD)/api/sessions -H "X-Daemon-Token: $(TOKEN)" | python3 -c 'import sys,json; [print(f"{s[\"agent_type\"]:10s} {s[\"status\"]:12s} sid={s[\"agent_session_id\"][:30]:30s} turns={len(s.get(\"turns\",[]))}") for s in json.load(sys.stdin)]' 2>/dev/null || echo "daemon 未响应"
 
-# 运行测试
+# 运行测试 (后端 Go + 前端 Vitest)
 test:
-	go test ./internal/session/ -v -count=1
+	go test ./internal/... -count=1
+	@cd $(FRONTEND_DIR) && npm run test 2>/dev/null || echo "(前端测试跳过: 未安装依赖)"

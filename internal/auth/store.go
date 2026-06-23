@@ -90,7 +90,7 @@ func (s *Store) CreateToken(userID int64) (string, error) {
 	hashedToken := hex.EncodeToString(hashed[:])
 
 	now := time.Now().UnixMilli()
-	expiresAt := now + 24*60*60*1000
+	expiresAt := now + tokenTTLms
 
 	_, err := s.db.Exec(
 		`INSERT INTO auth_tokens (user_id, token, expires_at, created_at) VALUES (?, ?, ?, ?)`,
@@ -103,6 +103,18 @@ func (s *Store) CreateToken(userID int64) (string, error) {
 	return rawToken, nil
 }
 
+// tokenTTLms is the server-side token lifetime. Kept in sync with the cookie
+// Max-Age (7 days) so an active user's cookie and server token expire together.
+// WebAuth auto-renews tokens that are within renewThresholdms of expiry, so
+// active users effectively never see a mid-session logout.
+const (
+	tokenTTLms         = 7 * 24 * 60 * 60 * 1000 // 7 days
+	renewThresholdms   = 24 * 60 * 60 * 1000     // renew if <1 day left
+)
+
+// ValidateToken returns the user for a raw token. It does NOT renew the token;
+// callers that want auto-renewal (e.g. WebAuth middleware) should use
+// ValidateAndMaybeRenew.
 var ErrTokenInvalid = errors.New("invalid or expired token")
 
 func (s *Store) ValidateToken(rawToken string) (*User, error) {
@@ -130,6 +142,50 @@ func (s *Store) ValidateToken(rawToken string) (*User, error) {
 	}
 
 	return &user, nil
+}
+
+// ValidateAndMaybeRenew validates a raw token and, if it expires within
+// renewThresholdms (1 day), extends its expiry by tokenTTLms (7 days) from now.
+// It returns the user, whether the token was renewed, and any error.
+//
+// The caller (WebAuth middleware) uses the renewed flag to re-send the
+// Set-Cookie header so the client cookie and server token stay in sync —
+// an active user never experiences a mid-session logout.
+func (s *Store) ValidateAndMaybeRenew(rawToken string) (*User, bool, error) {
+	hashed := sha256.Sum256([]byte(rawToken))
+	hashedToken := hex.EncodeToString(hashed[:])
+
+	var user User
+	var expiresAt int64
+	err := s.db.QueryRow(
+		`SELECT u.id, u.username, u.created_at, t.expires_at
+		 FROM auth_tokens t JOIN users u ON t.user_id = u.id
+		 WHERE t.token = ?`,
+		hashedToken,
+	).Scan(&user.ID, &user.Username, &user.CreatedAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, ErrTokenInvalid
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("query token: %w", err)
+	}
+
+	now := time.Now().UnixMilli()
+	if now > expiresAt {
+		s.db.Exec(`DELETE FROM auth_tokens WHERE token = ?`, hashedToken)
+		return nil, false, ErrTokenInvalid
+	}
+
+	// Auto-renew if less than 1 day remains.
+	renewed := false
+	if expiresAt-now < renewThresholdms {
+		newExpiry := now + tokenTTLms
+		if _, err := s.db.Exec(`UPDATE auth_tokens SET expires_at = ? WHERE token = ?`, newExpiry, hashedToken); err == nil {
+			renewed = true
+		}
+	}
+
+	return &user, renewed, nil
 }
 
 func (s *Store) RevokeToken(rawToken string) error {

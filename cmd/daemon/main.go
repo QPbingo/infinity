@@ -5,7 +5,7 @@
 //     via a shared events.jsonl file, using fsnotify for file watching.
 //  2. Periodically scans the OS process table to track agent process health,
 //     resource usage (CPU/Memory), and detect process death.
-//  3. Serves an HTTP API and WebSocket endpoint for a browser-based dashboard
+//  3. Serves an HTTP API and SSE endpoint for a browser-based dashboard
 //     that displays live session data.
 //
 // Startup sequence (each step depends on the previous):
@@ -27,9 +27,10 @@
 //	Step 8: Start PID Scanner – a background goroutine that scans system
 //	        processes every N seconds (default 15), matches agent processes
 //	        to known sessions, updates CPU/Memory metrics, detects death.
-//	Step 9: Start HTTP/WebSocket server – registers REST API routes,
-//	        starts the WebSocket Hub goroutine, starts the HTTP listener.
-//	        Wires SessionManager notifications to WebSocket broadcasts.
+//	Step 9: Start HTTP/SSE server – registers REST API routes in grouped
+//	        middleware (public/machine/web), starts the SSE Hub goroutine,
+//	        starts the HTTP listener. Wires SessionManager notifications to
+//	        SSE broadcasts. CORS allows the separately-deployed frontend.
 //	Step 10: Block on SIGINT/SIGTERM, then gracefully shutdown.
 //
 // Graceful shutdown:
@@ -59,7 +60,7 @@
 //	     │    computeDelta() → SetNotify callback
 //	     │         │
 //	     │         ▼
-//	     │    WebSocket Hub → broadcast to all connected dashboards
+//	     │    SSE Hub → broadcast to all connected dashboards
 //	     │
 //	     └──▶ OS process runs, consumes resources
 //	               │
@@ -71,7 +72,7 @@
 //	               └──▶ SessionManager.CheckIdleSessions() (idle timeout)
 //	                        │
 //	                        ▼
-//	                   SetNotify → WebSocket broadcast
+//	                   SetNotify → SSE broadcast
 package main
 
 import (
@@ -102,6 +103,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:9101", "HTTP listen address")
 	scanInterval := flag.Int("scan-interval", 15, "PID scan interval in seconds")
 	userID := flag.String("user-id", "local", "User identifier")
+	corsOrigins := flag.String("cors-origins", "http://localhost:5173", "Comma-separated allowed CORS origins (frontend origin(s))")
 	flag.Parse()
 
 	// ── Step 1: Prepare the working directory ─────────────────────────────
@@ -134,7 +136,7 @@ func main() {
 	// Generates a 256-bit random token on first run, persists to local-token.
 	// This token authenticates:
 	//   - hook binary → daemon (included in every hook event's daemon_token field)
-	//   - dashboard → daemon (X-Daemon-Token header or WebSocket auth message)
+	//   - machine API → daemon (X-Daemon-Token header for /health, /api/poll-input, ...)
 	// Uses constant-time comparison to prevent timing attacks.
 	tok := readOrCreateToken(monitorDir)
 	log.Printf("daemon token: %s", tok[:8]+"...")
@@ -249,22 +251,23 @@ func main() {
 	pidScanner.Start()
 	defer pidScanner.Stop() // closes stopCh, scanner goroutine exits
 
-	// ── Step 9: HTTP/WebSocket server startup ─────────────────────────────
-	// Creates the HTTP server with the following routes:
+	// ── Step 9: HTTP/SSE server startup ────────────────────────────────────
+	// Creates the HTTP server with routes registered in three auth groups:
 	//
-	//   GET /                  → Serves dashboard.html (no auth required)
-	//   GET /health            → Returns version + session count (auth required)
-	//   GET /api/sessions      → Lists all sessions as JSON (auth required)
-	//   GET /api/sessions/{key}→ Gets a single session by key (auth required)
-	//   GET /ws                → WebSocket upgrade (auth via first message)
+	//   public  → POST /api/auth/{register,login}     (no auth)
+	//   machine → /health, /api/poll-input, ...        (X-Daemon-Token)
+	//   web     → /api/* + /api/events/stream          (cookie/Bearer)
 	//
-	// HTTP auth uses X-Daemon-Token header with constant-time comparison.
-	// WebSocket auth uses the first JSON message: {"type":"auth","token":"..."}.
+	// The frontend is deployed separately; CORS (--cors-origins) permits the
+	// configured frontend origin(s) to call the API cross-origin with
+	// credentials (HttpOnly cookies). SSE (GET /api/events/stream) replaces
+	// the former WebSocket transport for real-time session/agent updates.
 	//
-	// On connect, WebSocket clients receive:
-	//   1. auth_ok confirmation
-	//   2. Full snapshot of all sessions
-	//   3. Real-time delta updates as sessions change
+	// On connect, SSE clients receive:
+	//   1. Full snapshot of all sessions
+	//   2. Hierarchy snapshot
+	//   3. Execution history
+	//   4. Real-time delta/session_added/hierarchy_updated/agent_* events
 	// Initialize agent SDK manager
 	agentMgr := sdk.NewAgentManager()
 	agentMgr.Register(sdk.AgentClaude, sdk.NewClaudeSDK(sdk.ClaudeOptions{}))
@@ -272,17 +275,17 @@ func main() {
 	agentMgr.Register(sdk.AgentCodex, sdk.NewCodexSDK(sdk.CodexOptions{}))
 	defer agentMgr.CloseAll()
 
-	srv := server.New(*listen, mgr, tok, authStore, hierStore, agentMgr)
+	srv := server.New(*listen, mgr, tok, authStore, hierStore, agentMgr, *corsOrigins)
 
-	// Wire SessionManager notifications to WebSocket broadcasts.
+	// Wire SessionManager notifications to SSE broadcasts.
 	// Whenever a session is created or modified, SetNotify calls back
 	// with the event type ("delta" or "session_added") and the changed data.
-	// The hub serializes this and broadcasts to all connected dashboard clients.
+	// The SSE hub serializes this and broadcasts to all connected dashboards.
 	mgr.SetNotify(func(eventType string, data interface{}) {
-		srv.GetHub().Notify(eventType, data)
+		srv.GetSSEHub().Notify(eventType, data)
 	})
 	mgr.SetHierarchyNotify(func(eventType string, data interface{}) {
-		srv.GetHub().Notify(eventType, data)
+		srv.GetSSEHub().Notify(eventType, data)
 	})
 
 	// Start the HTTP server in a background goroutine.
@@ -294,7 +297,7 @@ func main() {
 	}
 
 	log.Printf("agent-monitor-daemon started on %s", *listen)
-	log.Printf("Dashboard: http://%s", *listen)
+	log.Printf("API: http://%s  (frontend deployed separately)", *listen)
 
 	fmt.Println("[daemon] ready")
 
