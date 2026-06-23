@@ -159,7 +159,7 @@ func (s *Session) applyEvent(event *HookEvent, handler AgentHandler) {
 }
 
 func (s *Session) buildTurnEntry(event *HookEvent, handler AgentHandler) {
-	cls := handler.ClassifyEvent(event)
+	cls := handler.ClassifyEvent(event, s)
 	switch cls {
 	case ClassUserPrompt:
 		if s.webInputActive {
@@ -403,6 +403,7 @@ func (s *Session) extractModelOutput(payload json.RawMessage) {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
+	// Standard top-level keys (Claude, Codex, legacy).
 	for _, k := range []string{"last_assistant_message", "model_output", "output", "text", "response"} {
 		if v, ok := data[k].(string); ok && v != "" {
 			if s.AgentOutput != "" {
@@ -410,6 +411,15 @@ func (s *Session) extractModelOutput(payload json.RawMessage) {
 			}
 			s.AgentOutput += "[model] " + v
 			return
+		}
+	}
+	// OpenCode: text is nested inside part.text.
+	if part, ok := data["part"].(map[string]interface{}); ok {
+		if text, ok := part["text"].(string); ok && text != "" {
+			if s.AgentOutput != "" {
+				s.AgentOutput += "\n"
+			}
+			s.AgentOutput += "[model] " + text
 		}
 	}
 }
@@ -424,6 +434,55 @@ func (s *Session) extractBranchInfo(payload json.RawMessage) {
 	}
 	if branch, ok := data["branch"].(string); ok && branch != "" {
 		s.GitBranch = branch
+	}
+}
+
+// storeMessageRole extracts the role from an OpenCode message.updated event
+// and stores it on the session. Subsequent message.part.updated text events
+// use this role to decide whether the text is user input or model output,
+// without depending on the plugin.js _role hack.
+func (s *Session) storeMessageRole(payload json.RawMessage) {
+	if len(payload) == 0 {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	info, ok := data["info"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	role, _ := info["role"].(string)
+	if role != "" {
+		s.lastMessageRole = role
+	}
+}
+
+// extractSessionTitle pulls the human-readable title from a session.updated
+// event payload. OpenCode computes this server-side (e.g. "前后端分离数据交互…")
+// and pushes it in `info.title`. We only overwrite the session title when
+// OpenCode actually provides a non-empty value; the user-prompt-derived title
+// set by buildTurnEntry is left alone when info.title is empty.
+//
+// Preference: OpenCode's info.title wins over a stale title because OpenCode
+// updates it as the conversation evolves (initial user message → refined
+// summary), so always overwriting is the right call here.
+func (s *Session) extractSessionTitle(payload json.RawMessage) {
+	if len(payload) == 0 {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	info, ok := data["info"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	title, _ := info["title"].(string)
+	if title != "" {
+		s.SessionTitle = title
 	}
 }
 

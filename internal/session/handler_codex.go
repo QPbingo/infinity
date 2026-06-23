@@ -4,7 +4,7 @@ import "encoding/json"
 
 type CodexHandler struct{}
 
-func (h *CodexHandler) ClassifyEvent(event *HookEvent) EventClass {
+func (h *CodexHandler) ClassifyEvent(event *HookEvent, _ *Session) EventClass {
 	switch event.Event {
 	case "UserPromptSubmit":
 		return ClassUserPrompt

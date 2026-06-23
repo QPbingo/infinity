@@ -170,7 +170,13 @@ func extractFromStdin(payload []byte) stdinExtract {
 	}
 
 	return stdinExtract{
-		sessionID: extractString(data, "session_id", "sessionId", "sessionID", "sid", "id"),
+		// `id` is intentionally NOT in the fallback list: many agent payloads
+		// carry a top-level `id` field that is unrelated to the session
+		// (e.g. OpenCode plugin.added events have `{"id":"vercel"}`). Treating
+		// those as session_id creates dozens of bogus sessions per agent start.
+		// Callers that genuinely have a session id must set it on one of the
+		// explicit session_id/sessionId/sessionID/sid fields.
+		sessionID: extractString(data, "session_id", "sessionId", "sessionID", "sid"),
 		event:     extractString(data, "hook_event_name", "hookEventName", "event_name", "eventName", "event_type", "eventType", "event", "type", "name"),
 	}
 }

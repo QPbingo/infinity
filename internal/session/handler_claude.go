@@ -4,7 +4,7 @@ import "encoding/json"
 
 type ClaudeCodeHandler struct{}
 
-func (h *ClaudeCodeHandler) ClassifyEvent(event *HookEvent) EventClass {
+func (h *ClaudeCodeHandler) ClassifyEvent(event *HookEvent, _ *Session) EventClass {
 	switch event.Event {
 	case "UserPromptSubmit":
 		return ClassUserPrompt

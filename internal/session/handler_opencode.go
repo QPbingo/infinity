@@ -4,7 +4,7 @@ import "encoding/json"
 
 type OpenCodeHandler struct{}
 
-func (h *OpenCodeHandler) ClassifyEvent(event *HookEvent) EventClass {
+func (h *OpenCodeHandler) ClassifyEvent(event *HookEvent, sess *Session) EventClass {
 	switch event.Event {
 	case "tool.execute.before":
 		return ClassPreTool
@@ -12,6 +12,12 @@ func (h *OpenCodeHandler) ClassifyEvent(event *HookEvent) EventClass {
 		return ClassPostTool
 	case "message.part.updated":
 		partType, status, role := parsePartPayload(event.Payload)
+		// Fallback: if the plugin.js hasn't embedded _role (old version,
+		// or message.updated hasn't arrived yet), use the per-session
+		// lastMessageRole tracked from message.updated events by OnEvent.
+		if role == "" && sess != nil {
+			role = sess.lastMessageRole
+		}
 		if partType == "text" && role == "user" {
 			return ClassUserPrompt
 		}
@@ -144,11 +150,18 @@ func (h *OpenCodeHandler) LifecycleStatus(event string) (Status, bool) {
 
 func (h *OpenCodeHandler) OnEvent(sess *Session, event *HookEvent) {
 	switch event.Event {
+	case "message.updated":
+		sess.storeMessageRole(event.Payload)
 	case "message.part.updated":
-		partType, _, _ := parsePartPayload(event.Payload)
+		partType, _, role := parsePartPayload(event.Payload)
+		if role == "" {
+			role = sess.lastMessageRole
+		}
 		switch partType {
 		case "text":
-			sess.extractModelOutput(event.Payload)
+			if role != "user" {
+				sess.extractModelOutput(event.Payload)
+			}
 		case "tool":
 			sess.extractToolInfo(event.Payload)
 			sess.appendAgentOutput(event.Payload)
@@ -158,5 +171,7 @@ func (h *OpenCodeHandler) OnEvent(sess *Session, event *HookEvent) {
 		sess.appendAgentOutput(event.Payload)
 	case "vcs.branch.updated":
 		sess.extractBranchInfo(event.Payload)
+	case "session.updated":
+		sess.extractSessionTitle(event.Payload)
 	}
 }

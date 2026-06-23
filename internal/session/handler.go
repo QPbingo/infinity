@@ -15,7 +15,7 @@ const (
 
 // AgentHandler provides agent-specific event processing logic.
 type AgentHandler interface {
-	ClassifyEvent(event *HookEvent) EventClass
+	ClassifyEvent(event *HookEvent, sess *Session) EventClass
 	ExtractToolName(payload json.RawMessage) string
 	ExtractToolInput(payload json.RawMessage) string
 	ExtractToolOutput(payload json.RawMessage) string

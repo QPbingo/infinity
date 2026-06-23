@@ -5,6 +5,10 @@ interface AuthResponse {
   user: User
 }
 
+interface MeResponse {
+  user: User
+}
+
 export async function register(username: string, password: string): Promise<User> {
   const data = await request<AuthResponse>('/api/auth/register', {
     method: 'POST',
@@ -25,28 +29,25 @@ export async function logout(): Promise<void> {
   await request<void>('/api/auth/logout', { method: 'POST' })
 }
 
-// checkAuth verifies the current cookie is valid by hitting a protected
-// endpoint. Returns the user if authenticated, null otherwise. Used on page
-// load to restore the session without a login form.
-export async function checkAuth(): Promise<User | null> {
+// me hits GET /api/auth/me — backend reads the cookie and returns the
+// authenticated user, including the username. This replaces the old
+// `isAuthed()` hack that returned a placeholder "User" on reload.
+// Returns null on 401 (cookie expired / never set) so callers can decide
+// whether to render the login page.
+export async function me(): Promise<User | null> {
   try {
-    const res = await request<User>('/api/users', { method: 'GET' })
-    // /api/users returns a list, not a user; use a dedicated lightweight
-    // check instead. Fall through to the hierarchy endpoint which any
-    // authed user can read.
-    void res
-    return null
+    const res = await request<MeResponse>('/api/auth/me', { method: 'GET' })
+    return res?.user ?? null
   } catch {
     return null
   }
 }
 
-// whoami hits GET /api/hierarchy (any authed user can read it). If it returns
-// 200, the cookie is valid. We can't get the username from it, so callers
-// should cache the username from login.
+// whoami is the legacy boolean probe retained for tests that only need to
+// know whether the cookie is valid. New code should prefer `me()`.
 export async function isAuthed(): Promise<boolean> {
   try {
-    await request('/api/hierarchy', { method: 'GET' })
+    await request('/api/auth/me', { method: 'GET' })
     return true
   } catch {
     return false

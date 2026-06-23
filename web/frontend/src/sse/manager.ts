@@ -1,6 +1,6 @@
 import { API_BASE, SSE_PATH } from '../config'
+import { Store } from '../state/store'
 
-// SSE event types pushed by the server. Matches the Go SSEHub message types.
 export type SSEEventType =
   | 'snapshot'
   | 'session_added'
@@ -21,10 +21,29 @@ export interface SSEEvent {
 
 export type SSEHandler = (event: SSEEvent) => void
 
-// Heartbeat / timeout tuning. The server sends a `: ping` SSE comment every
-// 25s; if we receive nothing (data or comment) for 60s we treat the connection
-// as dead and close it so EventSource's auto-reconnect kicks in.
+// Connection states surfaced to the UI. `disconnected` covers both "never
+// opened" and "closed + waiting for retry" so the indicator pill is a single
+// uni-polar flag instead of a tri-state.
+export type SSEStatus = 'disconnected' | 'connecting' | 'connected'
+
+// Heartbeat / timeout tuning. Server sends `: ping` SSE comments every 25s;
+// if we receive nothing (data or comment) for 60s we treat the connection as
+// dead and force reconnect.
 const DEAD_TIMEOUT_MS = 60_000
+
+// SSEStatusBus is a tiny pub/sub for status changes. SSEManager writes,
+// ConnectionIndicator reads. Keeping it separate from the SSEManager's
+// event stream avoids UI coupling to private internals.
+class SSEStatusBus extends Store {
+  private _current: SSEStatus = 'disconnected'
+  current(): SSEStatus { return this._current }
+  set(s: SSEStatus): void {
+    if (s === this._current) return
+    this._current = s
+    this.notify()
+  }
+}
+export const sseStatusBus = new SSEStatusBus()
 
 // SSEManager owns the EventSource connection and dispatches parsed events to
 // registered handlers. It also coordinates multi-tab sharing via
@@ -32,10 +51,10 @@ const DEAD_TIMEOUT_MS = 60_000
 // tabs receive events relayed over BroadcastChannel.
 //
 // Leader election (BC-02/03/04):
-//   - The leader broadcasts a `{leader: 1}` heartbeat every 3s.
+//   - The leader broadcasts a heartbeat every 3s.
 //   - A follower that does not see a leader heartbeat for 5s becomes leader.
-//   - When the leader tab closes (beforeunload), it broadcasts `{leader: -1}`
-//     so a follower can immediately take over (no 5s wait).
+//   - When the leader tab closes (beforeunload), it broadcasts `leader_gone`
+//     so a follower can take over quickly.
 export class SSEManager {
   private es: EventSource | null = null
   private handlers = new Set<SSEHandler>()
@@ -50,49 +69,50 @@ export class SSEManager {
     this.initBroadcastChannel()
   }
 
-  // Start the connection. Decides leader/follower role.
   connect(): void {
     if (this.disposed) return
-    if (typeof BroadcastChannel !== 'undefined') {
+    sseStatusBus.set('connecting')
+    if (this.bc) {
       // Ask if there's already a leader; wait briefly before self-promoting.
-      this.bc?.postMessage({ kind: 'whois_leader' })
+      this.bc.postMessage({ kind: 'whois_leader' })
       this.followerWait = setTimeout(() => this.becomeLeader(), 500)
     } else {
-      // No BroadcastChannel support — always leader (single-tab fallback).
+      // No BroadcastChannel — always leader (single-tab fallback).
       this.becomeLeader()
     }
   }
 
   private initBroadcastChannel(): void {
     if (typeof BroadcastChannel === 'undefined') return
-    this.bc = new BroadcastChannel('agent-monitor-sse')
-    this.bc.onmessage = (e) => this.onBCMessage(e.data)
-    window.addEventListener('beforeunload', () => {
-      if (this.isLeader) this.bc?.postMessage({ kind: 'leader_gone' })
-    })
+    try {
+      this.bc = new BroadcastChannel('agent-monitor-sse')
+      this.bc.onmessage = (e) => this.onBCMessage(e.data)
+      window.addEventListener('beforeunload', () => {
+        if (this.isLeader) this.bc?.postMessage({ kind: 'leader_gone' })
+      })
+    } catch {
+      // Some browsers expose BroadcastChannel but constructing it throws
+      // (e.g. private-mode Safari). Fall back to single-tab mode.
+      this.bc = null
+    }
   }
 
   private onBCMessage(msg: { kind: string; event?: SSEEvent }): void {
     switch (msg.kind) {
       case 'leader_here':
-        // A leader exists; cancel self-promotion.
         if (this.followerWait) {
           clearTimeout(this.followerWait)
           this.followerWait = null
         }
         break
       case 'leader_heartbeat':
-        // Leader is alive; reset takeover timer.
         if (this.followerWait) clearTimeout(this.followerWait)
         this.followerWait = setTimeout(() => this.becomeLeader(), 5_000)
         break
       case 'leader_gone':
       case 'whois_leader':
-        if (this.isLeader) {
-          this.bc?.postMessage({ kind: 'leader_here' })
-        }
+        if (this.isLeader) this.bc?.postMessage({ kind: 'leader_here' })
         if (msg.kind === 'leader_gone' && !this.isLeader) {
-          // Leader left; try to take over quickly.
           if (this.followerWait) clearTimeout(this.followerWait)
           this.followerWait = setTimeout(() => this.becomeLeader(), 200)
         }
@@ -107,7 +127,6 @@ export class SSEManager {
     if (this.isLeader) return
     this.isLeader = true
     this.bc?.postMessage({ kind: 'leader_here' })
-    // Heartbeat so followers know we're alive (BC-03).
     this.leaderHeartbeat = setInterval(() => {
       this.bc?.postMessage({ kind: 'leader_heartbeat' })
     }, 3_000)
@@ -116,43 +135,44 @@ export class SSEManager {
 
   private openEventSource(): void {
     if (this.es) this.es.close()
+    sseStatusBus.set('connecting')
     const url = API_BASE + SSE_PATH
-    this.es = new EventSource(url, { withCredentials: true })
+    try {
+      this.es = new EventSource(url, { withCredentials: true })
+    } catch {
+      // EventSource undefined in some restricted environments — surface to
+      // the user and stop retrying.
+      sseStatusBus.set('disconnected')
+      this.dispatch({ type: 'agent_error', error: 'EventSource unsupported', __auth: true } as SSEEvent)
+      return
+    }
+
+    this.es.onopen = () => {
+      sseStatusBus.set('connected')
+      this.resetDeadTimer()
+    }
 
     this.es.onmessage = (e) => {
       this.resetDeadTimer()
       try {
         const event = JSON.parse(e.data) as SSEEvent
         this.dispatch(event)
-        // Relay to follower tabs.
         this.bc?.postMessage({ kind: 'relay_event', event })
       } catch {
         // ignore malformed
       }
     }
 
-    // `: ping` comments do not trigger onmessage; EventSource fires onmessage
-    // only for unnamed data events. The server sends pings as comments which
-    // keep the TCP connection alive but are not exposed to JS. We rely on the
-    // dead timer + the server's actual data events for liveness. To detect
-    // pings, we use onerror/onopen timing as a proxy.
-    this.es.onopen = () => this.resetDeadTimer()
-
     this.es.onerror = () => {
-      // EventSource auto-reconnects on transient errors. If the connection is
-      // CLOSED (readyState 2, not reconnecting), and it looks like auth
-      // failure, close and notify so the UI can show the login page
-      // (constraint D). readyState 2 === EventSource.CLOSED; we use the
-      // numeric literal to avoid depending on the EventSource constructor
-      // being present in the global scope at runtime.
+      // CLOSED state → assume auth failure (server returned 401 and gave up).
       if (this.es?.readyState === 2) {
         this.clearDeadTimer()
-        // A CLOSED state after an error usually means the server returned a
-        // non-200 (e.g. 401) and gave up. Treat as auth failure.
+        sseStatusBus.set('disconnected')
         this.dispatch({ type: 'agent_error', error: 'sse_closed', __auth: true } as SSEEvent)
+        return
       }
-      // Otherwise (readyState 0/CONNECTING), EventSource is retrying; reset
-      // the dead timer so we don't fire while it's reconnecting.
+      // CONNECTING state → EventSource is retrying; just mark us as connecting.
+      sseStatusBus.set('connecting')
       this.resetDeadTimer()
     }
     this.resetDeadTimer()
@@ -162,18 +182,14 @@ export class SSEManager {
     if (this.deadTimer) clearTimeout(this.deadTimer)
     this.deadTimer = setTimeout(() => {
       // No traffic for DEAD_TIMEOUT_MS — force reconnect.
-      if (this.es) {
-        this.es.close()
-        this.openEventSource()
-      }
+      if (this.es) this.es.close()
+      this.openEventSource()
     }, DEAD_TIMEOUT_MS)
   }
 
   private clearDeadTimer(): void {
-    if (this.deadTimer) {
-      clearTimeout(this.deadTimer)
-      this.deadTimer = null
-    }
+    if (this.deadTimer) clearTimeout(this.deadTimer)
+    this.deadTimer = null
   }
 
   private dispatch(event: SSEEvent): void {
@@ -199,12 +215,13 @@ export class SSEManager {
     this.clearDeadTimer()
     if (this.leaderHeartbeat) clearInterval(this.leaderHeartbeat)
     if (this.followerWait) clearTimeout(this.followerWait)
-    if (this.es) {
-      this.es.close()
-      this.es = null
+    if (this.es) this.es.close()
+    this.es = null
+    if (this.isLeader && this.bc) this.bc.postMessage({ kind: 'leader_gone' })
+    if (this.bc) {
+      try { this.bc.close() } catch { /* ignore */ }
     }
-    if (this.isLeader) this.bc?.postMessage({ kind: 'leader_gone' })
-    this.bc?.close()
     this.bc = null
+    sseStatusBus.set('disconnected')
   }
 }

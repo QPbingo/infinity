@@ -16,6 +16,24 @@ export function trunc(s: string | null | undefined, max: number): string {
 
 export function formatTime(ms: number | null | undefined): string {
   if (!ms) return ''
+  const now = Date.now()
+  const diff = now - ms
+  if (diff < 0) {
+    // Clock skew / future timestamp — fall back to absolute.
+    return new Date(ms).toLocaleTimeString('en-US', { hour12: false })
+  }
+  if (diff < 60_000) return 'just now'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d ago`
+  // Older than 30 days: show absolute date.
+  return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
+// formatTimeAbsolute is the legacy absolute-time variant, used where the
+// timeline header wants a verifiable timestamp rather than a fuzzy "5m ago".
+export function formatTimeAbsolute(ms: number | null | undefined): string {
+  if (!ms) return ''
   return new Date(ms).toLocaleTimeString('en-US', { hour12: false })
 }
 

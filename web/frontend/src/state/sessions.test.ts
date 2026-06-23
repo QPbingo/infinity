@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { sessionsStore, type Session } from './sessions'
+import { sessionsStore, mergeTurns, type Session } from './sessions'
 
 const mk = (key: string, status = 'active'): Session => ({
   session_key: key,
@@ -57,5 +57,41 @@ describe('sessionsStore', () => {
     const list = sessionsStore.filteredList(null, null)
     expect(list[0].session_key).toBe('s2')
     expect(list[1].session_key).toBe('s1')
+  })
+
+  it('mergeTurns dedupes by turn_idx and preserves order', () => {
+    const prev = [{ turn_idx: 0, user_input: 'hi', user_ts: 1, entries: [] }]
+    const incoming = [
+      { turn_idx: 1, user_input: 'next', user_ts: 2, entries: [] },
+      { turn_idx: 0, user_input: 'hi', user_ts: 1, entries: [{ event: 'PreToolUse' }] },
+    ]
+    const merged = mergeTurns(prev, incoming)
+    expect(merged.map((t) => t.turn_idx)).toEqual([0, 1])
+    expect(merged[0].entries[0].event).toBe('PreToolUse')
+  })
+
+  it('delta preserves draft inputs + evolves turns instead of replacing', () => {
+    sessionsStore.applyEvent({ type: 'snapshot', sessions: [mk('k1')] } as never)
+    sessionsStore.setDraftInput('k1', 'typing')
+    sessionsStore.applyEvent({ type: 'delta', session_key: 'k1', changes: { turn_count: 1, turns: [{ turn_idx: 0, user_input: 'hi', user_ts: 0, entries: [] }] } } as never)
+    // delta should not wipe draft inputs.
+    expect(sessionsStore.draftInputs['k1']).toBe('typing')
+    expect(sessionsStore.sessions['k1'].turns).toHaveLength(1)
+    // a second delta with a new turn appends rather than replacing.
+    sessionsStore.applyEvent({ type: 'delta', session_key: 'k1', changes: { turn_count: 2, turns: [{ turn_idx: 1, user_input: 'two', user_ts: 1, entries: [] }] } } as never)
+    expect(sessionsStore.sessions['k1'].turns).toHaveLength(2)
+  })
+
+  it('statusCounts and agentTypeCounts compute live buckets', () => {
+    sessionsStore.applyEvent({ type: 'snapshot', sessions: [
+      mk('a', 'active'),
+      mk('b', 'idle'),
+      mk('c', 'idle'),
+    ] } as never)
+    const sc = sessionsStore.statusCounts()
+    expect(sc.active).toBe(1)
+    expect(sc.idle).toBe(2)
+    const ac = sessionsStore.agentTypeCounts()
+    expect(ac.claude).toBe(3)
   })
 })

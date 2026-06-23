@@ -1,26 +1,28 @@
 import { sendPrompt, cancelExecution } from '../api/agent'
 import { agentStore, type Execution } from '../state/agent'
 import { esc } from '../utils/format'
+import { toast } from './toast'
 
-// Render the agent control panel into #agent-panel (created by the shell).
-// Replaces dashboard.html's AgentPanel + sendAgentPrompt/cancelAgent.
+// renderAgentPanel mounts the agent control panel into #agent-panel (created
+// by the shell). Replaces the old inline-style version with the design system.
 export function renderAgentPanel(): void {
   const host = document.getElementById('agent-panel')
   if (!host) return
+  host.className = 'agent-panel'
   host.innerHTML = `
-    <div id="agent-panel-header" style="padding:8px 12px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;background:#1c2128">
-      <span style="font-size:0.8em;color:#58a6ff">Agent Control</span>
-      <span style="font-size:0.6em;color:#8b949e" id="agent-panel-arrow">▼</span>
+    <div class="agent-panel-header" id="agent-panel-header">
+      <span>Agent Control</span>
+      <span class="agent-panel-arrow" id="agent-panel-arrow">▼</span>
     </div>
-    <div id="agent-panel-body" style="display:none;padding:10px 12px">
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <select id="agent-select" style="flex:1;padding:4px;background:#0d1117;border:1px solid #30363d;border-radius:3px;color:#c9d1d9;font-size:0.76em">
+    <div class="agent-panel-body" id="agent-panel-body">
+      <div class="agent-panel-row">
+        <select id="agent-select" aria-label="Agent type">
           <option value="claude">Claude Code</option>
           <option value="opencode">OpenCode</option>
           <option value="codex">Codex</option>
         </select>
-        <input id="agent-session-id" placeholder="Session ID (optional)" style="flex:1;padding:4px;background:#0d1117;border:1px solid #30363d;border-radius:3px;color:#c9d1d9;font-size:0.76em">
-        <select id="agent-timeout" style="padding:4px;background:#0d1117;border:1px solid #30363d;border-radius:3px;color:#c9d1d9;font-size:0.7em">
+        <input id="agent-session-id" type="text" placeholder="Session ID (optional)">
+        <select id="agent-timeout" aria-label="Timeout">
           <option value="5">5m</option>
           <option value="10" selected>10m</option>
           <option value="30">30m</option>
@@ -28,15 +30,13 @@ export function renderAgentPanel(): void {
           <option value="120">2h</option>
         </select>
       </div>
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <textarea id="agent-prompt" rows="2" placeholder="Enter prompt..." style="flex:1;padding:6px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:0.78em;resize:vertical"></textarea>
+      <textarea id="agent-prompt" class="agent-prompt" rows="2" placeholder="Enter prompt…"></textarea>
+      <div class="agent-actions">
+        <button id="agent-send" class="btn-send">Send</button>
+        <button id="agent-cancel" class="btn-cancel">Cancel</button>
+        <span id="agent-status" class="agent-status"></span>
       </div>
-      <div style="display:flex;gap:6px">
-        <button id="agent-send" style="padding:5px 14px;background:#238636;color:white;border:none;border-radius:4px;cursor:pointer;font-size:0.76em">Send</button>
-        <button id="agent-cancel" style="padding:5px 10px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;cursor:pointer;font-size:0.72em">Cancel</button>
-        <span id="agent-status" style="font-size:0.7em;color:#8b949e;align-self:center"></span>
-      </div>
-      <div id="agent-output" style="margin-top:8px;max-height:200px;overflow-y:auto;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:8px;font-size:0.72em;font-family:'SF Mono',monospace;white-space:pre-wrap;word-break:break-word;display:none"></div>
+      <div id="agent-output" class="agent-output"></div>
     </div>`
 
   const header = document.getElementById('agent-panel-header')
@@ -44,9 +44,8 @@ export function renderAgentPanel(): void {
   const arrow = document.getElementById('agent-panel-arrow')
   if (header && body && arrow) {
     header.onclick = () => {
-      const open = body.style.display === 'none'
-      body.style.display = open ? 'block' : 'none'
-      arrow.textContent = open ? '▲' : '▼'
+      const open = body.classList.toggle('open')
+      arrow.classList.toggle('open', open)
     }
   }
   const sendBtn = document.getElementById('agent-send')
@@ -58,19 +57,25 @@ export function renderAgentPanel(): void {
 async function onSend(): Promise<void> {
   const agentType = (document.getElementById('agent-select') as HTMLSelectElement)?.value ?? 'claude'
   const sessionId = (document.getElementById('agent-session-id') as HTMLInputElement)?.value.trim() ?? ''
-  const prompt = (document.getElementById('agent-prompt') as HTMLTextAreaElement)?.value.trim() ?? ''
+  const promptEl = document.getElementById('agent-prompt') as HTMLTextAreaElement | null
+  const prompt = promptEl?.value.trim() ?? ''
   const timeoutMin = parseInt((document.getElementById('agent-timeout') as HTMLSelectElement)?.value ?? '10') || 10
-  if (!prompt) return
+  if (!prompt) {
+    toast.warn('Prompt is empty')
+    return
+  }
   const status = document.getElementById('agent-status')
-  if (status) status.textContent = 'Running...'
+  if (status) status.textContent = 'Running…'
   try {
     const res = await sendPrompt(agentType, sessionId, prompt, timeoutMin)
-    // Backfill session id if auto-created (AG-14).
+    if (promptEl) promptEl.value = ''
     const sidInput = document.getElementById('agent-session-id') as HTMLInputElement | null
     if (sidInput && !sessionId) sidInput.value = res.session_id
     agentStore.setCurrent(res.exec_id)
+    toast.ok('Execution started')
   } catch (e) {
-    if (status) status.textContent = 'Error: ' + (e as Error).message
+    if (status) status.textContent = 'Error'
+    toast.error('Send failed: ' + ((e as Error).message || 'unknown'))
   }
 }
 
@@ -78,50 +83,73 @@ async function onCancel(): Promise<void> {
   const agentType = (document.getElementById('agent-select') as HTMLSelectElement)?.value ?? 'claude'
   const sessionId = (document.getElementById('agent-session-id') as HTMLInputElement)?.value.trim() ?? ''
   const status = document.getElementById('agent-status')
-  if (status) status.textContent = 'Cancelling...'
+  if (status) status.textContent = 'Cancelling…'
   try {
     await cancelExecution(agentType, sessionId, agentStore.currentExecId ?? undefined)
+    toast.info('Cancelled')
   } catch (e) {
-    if (status) status.textContent = 'Error: ' + (e as Error).message
+    if (status) status.textContent = 'Error'
+    toast.error('Cancel failed: ' + ((e as Error).message || 'unknown'))
   }
 }
 
-// Render the execution history + current execution's messages. Called when
-// agentStore changes. Replaces dashboard.html's renderExecHistory/showExecution.
+// renderExecHistory draws the current execution's messages, or a clickable
+// list of past executions. A "back" link returns to the list view (#20).
 export function renderExecHistory(): void {
   const output = document.getElementById('agent-output')
-  if (!output || agentStore.executions.length === 0) return
-  output.style.display = 'block'
+  if (!output) return
+  if (agentStore.executions.length === 0) {
+    output.classList.remove('is-open')
+    output.innerHTML = ''
+    return
+  }
+  output.classList.add('is-open')
   const current = agentStore.executions.find((e) => e.id === agentStore.currentExecId)
   if (current) {
     output.innerHTML = renderExecutionMessages(current)
+    const back = output.querySelector('[data-action="exec-back"]')
+    if (back) {
+      ;(back as HTMLElement).onclick = () => {
+        agentStore.setCurrent(null)
+      }
+    }
   } else {
     output.innerHTML = agentStore.executions
-      .map((e) => `<div style="padding:4px 0;border-bottom:1px solid #21262d;cursor:pointer" data-exec="${esc(e.id)}">${statusIcon(e.status)} <b>${esc(e.agent_type ?? '')}</b> <span style="color:#8b949e">${esc((e.prompt ?? '').slice(0, 60))}</span></div>`)
+      .map((e) => `<div class="exec-row" data-exec="${esc(e.id)}">${statusIcon(e.status)} <b>${esc(e.agent_type ?? '')}</b> <span class="exec-preview">${esc((e.prompt ?? '').slice(0, 60))}</span></div>`)
       .join('')
     output.querySelectorAll('[data-exec]').forEach((el) => {
-      el.addEventListener('click', () => {
+      ;(el as HTMLElement).onclick = () => {
         agentStore.setCurrent((el as HTMLElement).dataset.exec ?? null)
-      })
+      }
     })
   }
 }
 
 function renderExecutionMessages(e: Execution): string {
-  let html = `<div style="color:#58a6ff;margin-bottom:6px">Prompt: ${esc(e.prompt ?? '')}</div>`
+  let html = `<div class="exec-back" data-action="exec-back">← Back to history</div>`
+  html += `<div class="exec-prompt-label">Prompt: ${esc(e.prompt ?? '')}</div>`
   for (const m of e.messages) {
     if (m.msg_type === 'tool_use' || m.type === 'tool_use') {
-      html += `<div style="color:#d2a8ff">[${esc(m.tool_name ?? 'tool')}] ${esc(m.tool_input ?? '')}</div>`
+      html += `<div class="msg-tool">[${esc(m.tool_name ?? 'tool')}] ${esc(m.tool_input ?? '')}</div>`
     } else if (m.content) {
-      html += `<div style="color:#c9d1d9">${esc(m.content)}</div>`
+      html += `<div class="msg-text">${esc(m.content)}</div>`
     }
   }
   if (e.status === 'error' && e.error) {
-    html += `<div style="color:#f85149">[ERROR] ${esc(e.error)}</div>`
+    html += `<div class="msg-error">[ERROR] ${esc(e.error)}</div>`
   }
   return html
 }
 
 function statusIcon(s: Execution['status']): string {
-  return s === 'running' ? '⏳' : s === 'completed' ? '✅' : s === 'error' ? '❌' : '⏹'
+  switch (s) {
+    case 'running':
+      return '<span class="exec-spin"></span>'
+    case 'completed':
+      return '<svg viewBox="0 0 16 16" width="14" height="14"><circle cx="8" cy="8" r="7" fill="none" stroke="var(--success-text)" stroke-width="1.5"/><path d="M5 8l2 2 4-4" fill="none" stroke="var(--success-text)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    case 'error':
+      return '<svg viewBox="0 0 16 16" width="14" height="14"><circle cx="8" cy="8" r="7" fill="none" stroke="var(--danger-text)" stroke-width="1.5"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5" fill="none" stroke="var(--danger-text)" stroke-width="1.5" stroke-linecap="round"/></svg>'
+    default:
+      return '<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="3" width="10" height="10" rx="2" fill="none" stroke="var(--text-muted)" stroke-width="1.5"/></svg>'
+  }
 }

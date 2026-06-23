@@ -84,10 +84,13 @@ export const AgentMonitorPlugin = async ({ client, directory }) => {
         }
       }
 
-      // Build payload — for .updated text parts, embed the
+      // Build payload — for message.part.updated text parts, embed the
       // message role so the session manager can distinguish user vs assistant.
+      // The OpenCode event name is "message.part.updated"; the previous check
+      // `t === ".updated"` never matched, so _role was never attached and the
+      // handler could not classify user prompts (titles stayed empty).
       let payload = p;
-      if (t === ".updated") {
+      if (t === "message.part.updated") {
         const part = p?.part;
         if (part?.type === "text" && part?.messageID) {
           const meta = msgRoles.get(part.messageID);

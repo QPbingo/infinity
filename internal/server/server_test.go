@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -336,6 +337,41 @@ func TestLoginCookieAuthenticates(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("cookie-authed /api/hierarchy status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestMeEndpoint covers the /api/auth/me endpoint: returns the authenticated
+// user's username (used by the SPA to restore the display name on reload).
+func TestMeEndpoint(t *testing.T) {
+	srv, tok := newTestServer(t)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	t.Cleanup(ts.Close)
+
+	// Without cookie → 401.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/auth/me", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-cred /api/auth/me status = %d, want 401", resp.StatusCode)
+	}
+
+	// With valid cookie → 200 + username "tester" (registered in newTestServer).
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: tok})
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/auth/me status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"username":"tester"`) {
+		t.Fatalf("/api/auth/me body = %s, want username tester", string(body))
 	}
 }
 

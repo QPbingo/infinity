@@ -17,27 +17,133 @@ Agent (Hook/Plugin) ──▶ agent-monitor-hook ──▶ events.jsonl ──fs
 
 ```bash
 make start      # 一键启动 (构建 + 初始化 + 注册 hook + daemon 后台)
-make web        # 打开 Web 看板
+make web        # 打开 Web 看板 (启动前端 dev server :5173)
 make status     # 查看运行状态
 make stop       # 停止 daemon
 make test       # 运行测试
 ```
 
-### 开发常用
+> 首次使用走 `make start`（含初始化 environment + 注册 agent hooks）。后续日常开发用 `./dev.sh` 即可，无需重复注册 hooks。
+
+---
+
+## 日常开发：`./dev.sh`
+
+`dev.sh` 专门面向「改完代码想立刻看到效果」的高频迭代场景，**前后端一起管理**，不重装 hooks、不动用户数据，PID/日志隔离在 `/tmp/agent-monitor-dev/`。
+
+### 基本动作
 
 ```bash
-make restart    # 重建 + 重启 daemon (保留数据)
-make reset      # 重建 + 清空所有数据 + 重启 (完全干净)
-make deploy     # 重建 + 重装 OpenCode 插件 + 重启 daemon
-make logs       # 查看 daemon 日志
-make sessions   # 列出所有 session
+./dev.sh start       # 后台启动前端 (Vite :5173) + 后端 (daemon :9101)
+./dev.sh stop        # 停止两者
+./dev.sh restart     # 重启两者（保留数据）
+./dev.sh status      # 查看状态 + 后端 /health 自动 ping
+./dev.sh logs        # tail 全部日志（Ctrl+C 退出）
+./dev.sh logs be     # 只跟后端
+./dev.sh logs fe     # 只跟前端
+./dev.sh help        # 帮助
+```
+
+### 可选参数（仅 `start` / `restart` 生效）
+
+```bash
+./dev.sh restart --build              # 先 make build 再起，确保 Go 二进制最新
+./dev.sh start --listen=0.0.0.0:9101  # 自定义后端监听地址
+./dev.sh start --port=5180            # 自定义前端端口
+```
+
+### 文件落盘
+
+| 文件 | 内容 |
+|------|------|
+| `/tmp/agent-monitor-dev/backend.pid` | 后端 daemon PID |
+| `/tmp/agent-monitor-dev/frontend.pid` | 前端 vite PID |
+| `/tmp/agent-monitor-dev/backend.log` | 后端日志 |
+| `/tmp/agent-monitor-dev/frontend.log` | 前端日志 |
+
+### dev.sh 的设计取舍
+
+- **PID 文件 + `kill -0` 检测**：跨重启跨 shell 也能正确追踪寿命，不依赖 `killall`
+- **直接调 `node_modules/.bin/vite`**：跳过 `npm run dev` 的 npm 父进程包裹，PID 落地准确、kill 一次干净
+- **端口预检**：启动前 `lsof` 探测 5173 / 9101，已被他人占用则拒绝启动并提示 `kill <PID>`
+- **SIGTERM → 1s 优雅期 → SIGKILL**：vite 和 daemon 都给退出机会，再补强杀
+- **依赖自动安装**：`bin/agent-monitor-daemon` 缺失就 `make build`，`node_modules` 缺了就 `npm install`
+- **curl 加 `--noproxy '*'`**：系统级 http_proxy（如 `127.0.0.1:7897`）拦截 localhost 时，status 也不会死掉
+
+---
+
+## 生命周期：Makefile 命令
+
+`Makefile` 把 stop / killall / nohup 等重复逻辑收敛到六条 helper target（`_init-env` / `_install-hooks` / `_stop-daemon` / `_start-daemon` / `_uninstall-hooks` / `_report`），所有生命周期命令共享它们，没一行 `killall` / `nohup` 重复写。
+
+执行 `make help` 可看全部命令与一句话说明（公共 target 自动列出，内部 helper 隐藏不显示）。
+
+### 启动 / 停止 / 重启 / 重置
+
+| 命令 | 说明 |
+|------|------|
+| `make start`   | 构建 + 初始化 environment + 注册 agent hooks + 后台启动 daemon（保留已有数据） |
+| `make stop`    | 仅停止 daemon，`~/.agent-monitor` 数据保留 |
+| `make restart` | 重新构建 + 重启 daemon（保留数据），不重装 hooks |
+| `make reset`   | 彻底重置：卸 hooks + 删 sqlite/events + 初始化 + 重启 |
+| `make deploy`  | 改完 OpenCode 插件后一键重装 + 重启 daemon |
+| `make dev`     | 前台运行 daemon，Ctrl+C 停止，方便看日志 |
+| `make web`     | 启动 Vite dev server，daemon 没跑会先调 `make start` |
+
+### 启动参数（可命令行覆盖）
+
+```bash
+make start LISTEN_ADDR=0.0.0.0:9101
+make restart CORS_ORIGINS=https://app.example.com
+make start LOG_FILE=/tmp/my-daemon.log
+```
+
+### 构建 / 安装
+
+| 命令 | 说明 |
+|------|------|
+| `make build`     | 编译 daemon / hook / setup 三件套 → `bin/` |
+| `make frontend` | 前端 `npm install && npm run build` → `web/frontend/dist/` |
+| `make build-all` | 后端 + 前端一键构建 |
+| `make install`  | 把三件套拷到 `/usr/local/bin/` |
+| `make clean`    | 停 daemon + 删 `bin/`（**不动** `~/.agent-monitor` 数据；想清数据用 `make reset`） |
+
+### 诊断 / 日志 / 状态
+
+| 命令 | 说明 |
+|------|------|
+| `make status`     | 运行状态：daemon 进程 / hooks 安装 / `/health` / 最近 3 条事件 |
+| `make logs`       | 打印最近 30 行 daemon 日志（一次性） |
+| `make logs-follow` | `tail -f` 实时跟踪（Ctrl+C 退出） |
+| `make sessions`   | 列出 daemon 已知 sessions（直连 :9101，需提供 COOKIE） |
+| `make diagnose`   | 端到端事件管线自检（hook 安装 → jsonl 写入 → daemon 健康检查） |
+
+`make sessions` 用法（ `/api/sessions` 走 WebAuth，不接受 daemon token）：
+
+```bash
+# 从浏览器 DevTools → Application → Cookies 复制 session_token 值
+make sessions COOKIE='session_token=<value>'
 ```
 
 ### 测试
 
+| 命令 | 说明 |
+|------|------|
+| `make test` | 后端 `go test ./internal/...` + 前端 `vitest run` |
+| `make test-hook SESSION=<id>` | 对当前 daemon 发一个测试 hook 事件，并 ping `/health` 验证事件已收到 |
+
 ```bash
-make test-hook SESSION=test-001   # 发送测试事件
+make test-hook SESSION=test-001   # 发送 SessionStart + PostToolUse 两个事件
 ```
+
+### Makefile 与 dev.sh 分工
+
+| 谁来跑 | 干啥 |
+|:---|:---|
+| `make start` | 一次性初始化 + 注册 agent hooks；新机器装一遍 |
+| `make reset` | 彻底重置（清 data + hooks），数据丢失场景使用 |
+| `make deploy` | 改完 OpenCode 插件，重装 + 重启 |
+| **`./dev.sh`** | 日常迭代主入口：`./dev.sh restart --build` 热刷前后端，不触碰 hooks 和用户数据 |
 
 ## 目录结构
 

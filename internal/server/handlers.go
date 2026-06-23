@@ -57,6 +57,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	// ── Web group: all user-facing APIs + SSE stream (cookie/Bearer) ──
 	web := http.NewServeMux()
 	web.HandleFunc("POST /api/auth/logout", h.handleLogout)
+	web.HandleFunc("GET /api/auth/me", h.handleMe)
 	web.HandleFunc("GET /api/sessions", h.handleListSessions)
 	web.HandleFunc("GET /api/sessions/{key}", h.handleGetSession)
 	web.HandleFunc("POST /api/sessions/{key}/input", h.handleSendInput)
@@ -209,6 +210,19 @@ func (h *Handlers) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	auth.ClearSessionCookie(w)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleMe returns the currently authenticated user. Used by the SPA to
+// restore the username on page reload when the HttpOnly cookie is still valid
+// (replaces the old "User" placeholder). Requires WebAuth (injected via the
+// web route group).
+func (h *Handlers) handleMe(w http.ResponseWriter, r *http.Request) {
+	u := auth.GetUser(r)
+	if u == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"user": u})
 }
 
 // ── Hierarchy ──

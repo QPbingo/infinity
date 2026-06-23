@@ -69,6 +69,10 @@ type Session struct {
 	lastHookTime   int64
 	dbID           int64
 	webInputActive bool
+	// OpenCode: tracks the role ("user" / "assistant") of the most recent
+	// message.updated event, so subsequent message.part.updated events can
+	// be classified correctly without relying on the plugin.js _role hack.
+	lastMessageRole string
 }
 
 type Turn struct {
