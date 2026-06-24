@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,24 @@ func NewHandlers(s *session.SessionManager, tok string, sse *SSEHub, as *auth.St
 	return &Handlers{sessions: s, token: tok, sseHub: sse, authStore: as, hierStore: hs, agentMgr: am}
 }
 
+// parsePathID extracts an int64 path value and writes 400 on failure.
+func parsePathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
+	v, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("invalid %s", name)})
+		return 0, false
+	}
+	return v, true
+}
+
+// broadcastHierarchy pushes the latest hierarchy tree to all SSE clients.
+func (h *Handlers) broadcastHierarchy() {
+	if h.sseHub == nil || h.hierStore == nil {
+		return
+	}
+	h.sseHub.Notify("hierarchy_updated", nil)
+}
+
 // Register wires routes onto mux using a grouped layout with group-level
 // auth middleware. This replaces the previous per-route manual wrapping and
 // guarantees every web-facing API is authenticated.
@@ -36,7 +55,7 @@ func NewHandlers(s *session.SessionManager, tok string, sse *SSEHub, as *auth.St
 // Groups:
 //   - public:  /api/auth/{register,login}        — no auth
 //   - machine: /health, /api/poll-input,
-//              /api/sessions/{key}/pending-input — X-Daemon-Token (MachineAuth)
+//     /api/sessions/{key}/pending-input — X-Daemon-Token (MachineAuth)
 //   - web:     all other /api/* + /api/events/stream — cookie/Bearer (WebAuth)
 //
 // NOTE: logout is placed in the web group (requires valid token to revoke).
@@ -111,9 +130,13 @@ func (h *Handlers) curUser(w http.ResponseWriter, r *http.Request) *auth.User {
 }
 
 func (h *Handlers) checkWSAdmin(w http.ResponseWriter, r *http.Request, wid int64) bool {
-	if h.hierStore == nil { return true }
+	if h.hierStore == nil {
+		return true
+	}
 	u := h.curUser(w, r)
-	if u == nil { return false }
+	if u == nil {
+		return false
+	}
 	ok, _ := h.hierStore.CheckWorkspacePermission(u.ID, wid, hierarchy.LevelWorkspaceAdmin)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace admin required"})
@@ -122,9 +145,13 @@ func (h *Handlers) checkWSAdmin(w http.ResponseWriter, r *http.Request, wid int6
 }
 
 func (h *Handlers) checkProjAdmin(w http.ResponseWriter, r *http.Request, pid int64) bool {
-	if h.hierStore == nil { return true }
+	if h.hierStore == nil {
+		return true
+	}
 	u := h.curUser(w, r)
-	if u == nil { return false }
+	if u == nil {
+		return false
+	}
 	ok, _ := h.hierStore.CheckProjectPermission(u.ID, pid, hierarchy.LevelProjectAdmin)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "project admin required"})
@@ -133,13 +160,22 @@ func (h *Handlers) checkProjAdmin(w http.ResponseWriter, r *http.Request, pid in
 }
 
 func (h *Handlers) projWS(pid int64) int64 {
-	if p, _ := h.hierStore.GetProject(pid); p != nil { return p.WorkspaceID }; return 0
+	if p, _ := h.hierStore.GetProject(pid); p != nil {
+		return p.WorkspaceID
+	}
+	return 0
 }
 func (h *Handlers) topProj(tid int64) int64 {
-	if t, _ := h.hierStore.GetTopic(tid); t != nil { return t.ProjectID }; return 0
+	if t, _ := h.hierStore.GetTopic(tid); t != nil {
+		return t.ProjectID
+	}
+	return 0
 }
 func (h *Handlers) stoTop(sid int64) int64 {
-	if s, _ := h.hierStore.GetStory(sid); s != nil { return s.TopicID }; return 0
+	if s, _ := h.hierStore.GetStory(sid); s != nil {
+		return s.TopicID
+	}
+	return 0
 }
 
 // ── Auth ──
@@ -174,11 +210,13 @@ func isCrossOrigin(r *http.Request) bool {
 func (h *Handlers) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Username, Password string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username and password required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username and password required"})
+		return
 	}
 	u, err := h.authStore.Register(req.Username, req.Password)
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
 	}
 	tok, _ := h.authStore.CreateToken(u.ID)
 	auth.SetSessionCookie(w, tok, isCrossOrigin(r))
@@ -188,11 +226,13 @@ func (h *Handlers) handleRegister(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Username, Password string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
 	}
 	u, err := h.authStore.Login(req.Username, req.Password)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"}); return
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
 	}
 	tok, _ := h.authStore.CreateToken(u.ID)
 	auth.SetSessionCookie(w, tok, isCrossOrigin(r))
@@ -229,225 +269,331 @@ func (h *Handlers) handleMe(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleGetHierarchy(w http.ResponseWriter, r *http.Request) {
 	if h.hierStore == nil {
-		writeJSON(w, http.StatusOK, &hierarchy.HierarchyTree{}); return
+		writeJSON(w, http.StatusOK, &hierarchy.HierarchyTree{})
+		return
 	}
-	tree, _ := h.hierStore.GetFullHierarchy()
+	user := h.curUser(w, r)
+	if user == nil {
+		return
+	}
+	tree, err := scopedHierarchyForUser(h.hierStore, user.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, tree)
 }
 
 func (h *Handlers) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Name, Description string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
 	}
 	ws, err := h.hierStore.CreateWorkspace(req.Name, req.Description)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	h.hierStore.EnsureWorkspaceInspiration(ws.ID)
 	if u := auth.GetUser(r); u != nil {
 		h.hierStore.SetPermission(u.ID, "workspace", ws.ID, hierarchy.LevelWorkspaceAdmin, u.ID)
 	}
-	writeJSON(w, http.StatusCreated, ws)
+	writeJSON(w, http.StatusCreated, ws); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateWorkspace(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkWSAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkWSAdmin(w, r, id) {
+		return
+	}
 	var req struct{ Name, Description string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	h.hierStore.UpdateWorkspace(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkWSAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkWSAdmin(w, r, id) {
+		return
+	}
 	h.hierStore.DeleteWorkspace(id)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	wid, _ := strconv.ParseInt(r.PathValue("wid"), 10, 64)
+	wid, ok := parsePathID(w, r, "wid"); if !ok { return }
 	projects, _ := h.hierStore.ListProjects(wid)
 	writeJSON(w, http.StatusOK, projects)
 }
 
 func (h *Handlers) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	wid, _ := strconv.ParseInt(r.PathValue("wid"), 10, 64)
-	if !h.checkWSAdmin(w, r, wid) { return }
+	wid, ok := parsePathID(w, r, "wid"); if !ok { return }
+	if !h.checkWSAdmin(w, r, wid) {
+		return
+	}
 	var req struct{ Name, Description string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
 	}
 	proj, err := h.hierStore.CreateProject(wid, req.Name, req.Description)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	if u := auth.GetUser(r); u != nil {
 		h.hierStore.SetPermission(u.ID, "project", proj.ID, hierarchy.LevelProjectAdmin, u.ID)
 	}
-	writeJSON(w, http.StatusCreated, proj)
+	writeJSON(w, http.StatusCreated, proj); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, id) {
+		return
+	}
 	var req struct{ Name, Description string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	h.hierStore.UpdateProject(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkWSAdmin(w, r, h.projWS(id)) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkWSAdmin(w, r, h.projWS(id)) {
+		return
+	}
 	h.hierStore.DeleteProject(id)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListTopics(w http.ResponseWriter, r *http.Request) {
-	pid, _ := strconv.ParseInt(r.PathValue("pid"), 10, 64)
+	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
 	topics, _ := h.hierStore.ListTopics(pid)
 	writeJSON(w, http.StatusOK, topics)
 }
 
 func (h *Handlers) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
-	pid, _ := strconv.ParseInt(r.PathValue("pid"), 10, 64)
-	if !h.checkProjAdmin(w, r, pid) { return }
+	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
+	if !h.checkProjAdmin(w, r, pid) {
+		return
+	}
 	var req struct {
-		Name, Description, AgentType string
+		Name, Description string
+		AgentType         string `json:"agent_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
 	}
 	topic, err := h.hierStore.CreateTopic(pid, req.Name, req.Description, req.AgentType)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	writeJSON(w, http.StatusCreated, topic)
+	writeJSON(w, http.StatusCreated, topic); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateTopic(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, h.topProj(id)) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, h.topProj(id)) {
+		return
+	}
 	var req struct{ Name, Description string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	h.hierStore.UpdateTopic(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, h.topProj(id)) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, h.topProj(id)) {
+		return
+	}
 	h.hierStore.DeleteTopic(id)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListStories(w http.ResponseWriter, r *http.Request) {
-	tid, _ := strconv.ParseInt(r.PathValue("tid"), 10, 64)
+	tid, ok := parsePathID(w, r, "tid"); if !ok { return }
 	stories, _ := h.hierStore.ListStories(tid)
 	writeJSON(w, http.StatusOK, stories)
 }
 
 func (h *Handlers) handleCreateStory(w http.ResponseWriter, r *http.Request) {
-	pid, _ := strconv.ParseInt(r.PathValue("pid"), 10, 64)
-	tid, _ := strconv.ParseInt(r.PathValue("tid"), 10, 64)
-	if !h.checkProjAdmin(w, r, pid) { return }
+	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
+	tid, ok := parsePathID(w, r, "tid"); if !ok { return }
+	if !h.checkProjAdmin(w, r, pid) {
+		return
+	}
+	// Verify tid actually belongs to pid (ancestry check).
+	topic, err := h.hierStore.GetTopic(tid)
+	if err != nil || topic.ProjectID != pid {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "topic not found in this project"})
+		return
+	}
 	var req struct{ Name, Description string }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
 	}
 	story, err := h.hierStore.CreateStory(tid, req.Name, req.Description)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	writeJSON(w, http.StatusCreated, story)
+	writeJSON(w, http.StatusCreated, story); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateStory(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) {
+		return
+	}
 	var req struct{ Name, Description string }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	h.hierStore.UpdateStory(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteStory(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) {
+		return
+	}
 	h.hierStore.DeleteStory(id)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
 }
 
 // ── Permissions ──
 
 func (h *Handlers) handleListWorkspacePerms(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkWSAdmin(w, r, id) {
+		return
+	}
 	perms, _ := h.hierStore.ListPermissions("workspace", id)
 	writeJSON(w, http.StatusOK, perms)
 }
 
 func (h *Handlers) handleSetWorkspacePerm(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkWSAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkWSAdmin(w, r, id) {
+		return
+	}
 	var req struct {
 		UserID int64 `json:"user_id"`
 		Level  int   `json:"level"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
-	h.hierStore.SetPermission(req.UserID, "workspace", id, req.Level, 0)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Level != 10 && req.Level != 50 && req.Level != 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "level must be 10 (viewer) or 100 (admin)"})
+		return
+	}
+	h.hierStore.SetPermission(req.UserID, "workspace", id, req.Level, auth.GetUser(r).ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleRemoveWorkspacePerm(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	uid, _ := strconv.ParseInt(r.PathValue("uid"), 10, 64)
-	if !h.checkWSAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	uid, ok := parsePathID(w, r, "uid"); if !ok { return }
+	if !h.checkWSAdmin(w, r, id) {
+		return
+	}
 	h.hierStore.RemovePermission(uid, "workspace", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleListProjectPerms(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, id) {
+		return
+	}
 	perms, _ := h.hierStore.ListPermissions("project", id)
 	writeJSON(w, http.StatusOK, perms)
 }
 
 func (h *Handlers) handleSetProjectPerm(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if !h.checkProjAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	if !h.checkProjAdmin(w, r, id) {
+		return
+	}
 	var req struct {
 		UserID int64 `json:"user_id"`
 		Level  int   `json:"level"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
-	h.hierStore.SetPermission(req.UserID, "project", id, req.Level, 0)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Level != 10 && req.Level != 50 && req.Level != 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "level must be 10 (viewer) or 100 (admin)"})
+		return
+	}
+	h.hierStore.SetPermission(req.UserID, "project", id, req.Level, auth.GetUser(r).ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleRemoveProjectPerm(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	uid, _ := strconv.ParseInt(r.PathValue("uid"), 10, 64)
-	if !h.checkProjAdmin(w, r, id) { return }
+	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	uid, ok := parsePathID(w, r, "uid"); if !ok { return }
+	if !h.checkProjAdmin(w, r, id) {
+		return
+	}
 	h.hierStore.RemovePermission(uid, "project", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleListUsers(w http.ResponseWriter, r *http.Request) {
+	u := h.curUser(w, r)
+	if u == nil {
+		return
+	}
+	ids, _ := h.hierStore.GetAuthorizedWorkspaceIDs(u.ID)
+	isAdmin := false
+	for _, id := range ids {
+		if ok, _ := h.hierStore.CheckWorkspacePermission(u.ID, id, hierarchy.LevelWorkspaceAdmin); ok {
+			isAdmin = true
+			break
+		}
+	}
+	if !isAdmin {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace admin required"})
+		return
+	}
 	users, _ := h.authStore.ListUsers()
 	writeJSON(w, http.StatusOK, users)
 }
@@ -455,13 +601,25 @@ func (h *Handlers) handleListUsers(w http.ResponseWriter, r *http.Request) {
 // ── Sessions ──
 
 func (h *Handlers) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.sessions.GetSessions())
+	u := h.curUser(w, r)
+	if u == nil {
+		return
+	}
+	writeJSON(w, http.StatusOK, filterSessionsForUser(h.hierStore, u.ID, h.sessions.GetSessions()))
 }
 
 func (h *Handlers) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	u := h.curUser(w, r)
+	if u == nil {
+		return
+	}
 	sess := h.sessions.GetSession(r.PathValue("key"))
 	if sess == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	if !userCanAccessSession(h.hierStore, u.ID, sess) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session access denied"})
 		return
 	}
 	writeJSON(w, http.StatusOK, sess)
@@ -477,16 +635,34 @@ func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 // WebSocket send_input message. The input is enqueued for the agent plugin
 // to poll via GET /api/poll-input, and a delta is broadcast via SSE.
 func (h *Handlers) handleSendInput(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Text string `json:"text"` }
+	u := h.curUser(w, r)
+	if u == nil {
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Text == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text required"})
+		return
 	}
 	key := r.PathValue("key")
+	sess := h.sessions.GetSession(key)
+	if sess == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	if !userCanAccessSession(h.hierStore, u.ID, sess) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session access denied"})
+		return
+	}
 	if !h.sessions.HandleWebInput(key, req.Text) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"}); return
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -503,7 +679,8 @@ func (h *Handlers) handlePollInput(w http.ResponseWriter, r *http.Request) {
 	at := r.URL.Query().Get("agent_type")
 	sid := r.URL.Query().Get("agent_session_id")
 	if at == "" || sid == "" {
-		w.WriteHeader(http.StatusNoContent); return
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	key := session.ComputeSessionKey(h.sessions.UserID(), h.sessions.DeviceID(), at, sid)
 	if text := h.sessions.GetPendingInput(key); text != "" {
@@ -530,7 +707,8 @@ func (h *Handlers) agentType(r *http.Request) sdk.AgentType {
 
 func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
 	var req struct {
 		CWD            string   `json:"cwd"`
@@ -540,24 +718,30 @@ func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Reque
 		MaxTurns       int      `json:"max_turns"`
 		Title          string   `json:"title"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	sess, err := h.agentMgr.CreateSession(r.Context(), h.agentType(r), sdk.SessionOptions{
 		CWD: req.CWD, Model: req.Model, PermissionMode: sdk.PermissionMode(req.PermissionMode),
 		AllowedTools: req.AllowedTools, MaxTurns: req.MaxTurns, Title: req.Title,
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	writeJSON(w, http.StatusCreated, sess)
 }
 
 func (h *Handlers) handleAgentListSessions(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
 	list, err := h.agentMgr.ListSessions(r.Context(), h.agentType(r), r.URL.Query().Get("dir"))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -575,7 +759,8 @@ func (h *Handlers) handleAgentListSessions(w http.ResponseWriter, r *http.Reques
 // later than the REST response.
 func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
 	var req struct {
 		Prompt         string `json:"prompt"`
@@ -583,10 +768,12 @@ func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request)
 		TimeoutMinutes int    `json:"timeout_minutes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
 	}
 	if req.Prompt == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prompt required"}); return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prompt required"})
+		return
 	}
 
 	agentType := h.agentType(r)
@@ -609,7 +796,8 @@ func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request)
 		sess, err := h.agentMgr.CreateSession(ctx, agentType, sdk.SessionOptions{Title: truncatePrompt(req.Prompt, 60)})
 		if err != nil {
 			cancel()
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 		sessionID = sess.ID
 		// Inform all clients (including the initiator) of the new session id.
@@ -669,7 +857,8 @@ func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request)
 // to all dashboards via SSE (AG-07).
 func (h *Handlers) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
 	agentType := h.agentType(r)
 	sessionID := r.PathValue("id")
@@ -682,7 +871,8 @@ func (h *Handlers) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := h.agentMgr.CancelExecution(ctx, agentType, sessionID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	h.sseHub.BroadcastAgent(map[string]interface{}{
 		"type": "agent_cancelled", "exec_id": execID, "session_id": sessionID,
@@ -705,35 +895,51 @@ func truncatePrompt(s string, max int) string {
 
 func (h *Handlers) handleAgentResume(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
 	sess, err := h.agentMgr.ResumeSession(r.Context(), h.agentType(r), r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	writeJSON(w, http.StatusOK, sess)
 }
 
 func (h *Handlers) handleAgentRename(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
-	var req struct{ Title string `json:"title"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	if err := h.agentMgr.RenameSession(r.Context(), h.agentType(r), r.PathValue("id"), req.Title); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleAgentSetPermissions(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"}); return
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+		return
 	}
-	var req struct{ Mode string `json:"mode"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
 	if err := h.agentMgr.SetPermissionMode(h.agentType(r), r.PathValue("id"), sdk.PermissionMode(req.Mode)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()}); return
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

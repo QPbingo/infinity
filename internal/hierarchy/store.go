@@ -117,14 +117,23 @@ func (s *Store) UpdateWorkspace(id int64, name, description string) error {
 }
 
 func (s *Store) DeleteWorkspace(id int64) error {
-	// Cascade: delete stories → topics → projects → permissions → workspace
-	s.db.Exec(`DELETE FROM stories WHERE topic_id IN (SELECT id FROM topics WHERE project_id IN (SELECT id FROM projects WHERE workspace_id=?))`, id)
-	s.db.Exec(`DELETE FROM topics WHERE project_id IN (SELECT id FROM projects WHERE workspace_id=?)`, id)
-	s.db.Exec(`DELETE FROM projects WHERE workspace_id=?`, id)
-	s.db.Exec(`DELETE FROM permissions WHERE resource_type='workspace' AND resource_id=?`, id)
-	s.db.Exec(`DELETE FROM permissions WHERE resource_type='project' AND resource_id IN (SELECT id FROM projects WHERE workspace_id=?)`, id)
-	_, err := s.db.Exec(`DELETE FROM workspaces WHERE id=?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Cascade: delete permissions FIRST (while projects still exist),
+	// then stories → topics → projects → workspace.
+	tx.Exec(`DELETE FROM permissions WHERE resource_type='project' AND resource_id IN (SELECT id FROM projects WHERE workspace_id=?)`, id)
+	tx.Exec(`DELETE FROM permissions WHERE resource_type='workspace' AND resource_id=?`, id)
+	tx.Exec(`DELETE FROM stories WHERE topic_id IN (SELECT id FROM topics WHERE project_id IN (SELECT id FROM projects WHERE workspace_id=?))`, id)
+	tx.Exec(`DELETE FROM topics WHERE project_id IN (SELECT id FROM projects WHERE workspace_id=?)`, id)
+	tx.Exec(`DELETE FROM projects WHERE workspace_id=?`, id)
+	if _, err := tx.Exec(`DELETE FROM workspaces WHERE id=?`, id); err != nil {
+		return fmt.Errorf("delete workspace: %w", err)
+	}
+	return tx.Commit()
 }
 
 // ── Project CRUD ──
@@ -182,11 +191,18 @@ func (s *Store) UpdateProject(id int64, name, description string) error {
 }
 
 func (s *Store) DeleteProject(id int64) error {
-	s.db.Exec(`DELETE FROM stories WHERE topic_id IN (SELECT id FROM topics WHERE project_id=?)`, id)
-	s.db.Exec(`DELETE FROM topics WHERE project_id=?`, id)
-	s.db.Exec(`DELETE FROM permissions WHERE resource_type='project' AND resource_id=?`, id)
-	_, err := s.db.Exec(`DELETE FROM projects WHERE id=?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	tx.Exec(`DELETE FROM permissions WHERE resource_type='project' AND resource_id=?`, id)
+	tx.Exec(`DELETE FROM stories WHERE topic_id IN (SELECT id FROM topics WHERE project_id=?)`, id)
+	tx.Exec(`DELETE FROM topics WHERE project_id=?`, id)
+	if _, err := tx.Exec(`DELETE FROM projects WHERE id=?`, id); err != nil {
+		return fmt.Errorf("delete project: %w", err)
+	}
+	return tx.Commit()
 }
 
 // ── Topic CRUD ──
@@ -256,9 +272,16 @@ func (s *Store) UpdateTopic(id int64, name, description string) error {
 }
 
 func (s *Store) DeleteTopic(id int64) error {
-	s.db.Exec(`DELETE FROM stories WHERE topic_id=?`, id)
-	_, err := s.db.Exec(`DELETE FROM topics WHERE id=?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	tx.Exec(`DELETE FROM stories WHERE topic_id=?`, id)
+	if _, err := tx.Exec(`DELETE FROM topics WHERE id=?`, id); err != nil {
+		return fmt.Errorf("delete topic: %w", err)
+	}
+	return tx.Commit()
 }
 
 // ── Story CRUD ──
@@ -319,6 +342,34 @@ func (s *Store) LinkSessionToStory(storyID int64, sessionKey string) error {
 	return err
 }
 
+func (s *Store) GetProjectIDForStory(storyID int64) (int64, error) {
+	var projectID int64
+	err := s.db.QueryRow(`
+		SELECT t.project_id
+		FROM stories st
+		JOIN topics t ON t.id = st.topic_id
+		WHERE st.id = ?
+	`, storyID).Scan(&projectID)
+	if err != nil {
+		return 0, err
+	}
+	return projectID, nil
+}
+
+func (s *Store) GetProjectIDForSessionKey(sessionKey string) (int64, error) {
+	var projectID int64
+	err := s.db.QueryRow(`
+		SELECT t.project_id
+		FROM stories st
+		JOIN topics t ON t.id = st.topic_id
+		WHERE st.session_key = ?
+	`, sessionKey).Scan(&projectID)
+	if err != nil {
+		return 0, err
+	}
+	return projectID, nil
+}
+
 func (s *Store) UpdateStory(id int64, name, description string) error {
 	_, err := s.db.Exec(
 		`UPDATE stories SET name=?, description=?, updated_at=? WHERE id=?`,
@@ -338,8 +389,13 @@ func (s *Store) EnsureInspiration() (*Workspace, *Project, error) {
 	now := time.Now().UnixMilli()
 
 	s.db.Exec(`INSERT OR IGNORE INTO workspaces (id, name, description, status, created_at, updated_at) VALUES (1, 'Inspiration', 'Default workspace', 'open', ?, ?)`, now, now)
-	ws, _ := s.GetWorkspace(1)
-
+	ws, err := s.GetWorkspace(1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get inspiration workspace: %w", err)
+	}
+	if ws == nil {
+		return nil, nil, fmt.Errorf("inspiration workspace not found after creation")
+	}
 	proj, err := s.EnsureWorkspaceInspiration(ws.ID)
 	return ws, proj, err
 }
@@ -400,13 +456,14 @@ func (s *Store) FindOrCreateInspirationStory(agentType, sessionKey, sessionTitle
 		return existing, nil
 	}
 
-	// Find the inspiration project (any workspace) and its matching agent topic
+	// Find the inspiration project within workspace 1 (the default Inspiration
+	// workspace), matching the agent type topic.
 	var projID, topicID int64
 	err = s.db.QueryRow(`
 		SELECT p.id, t.id FROM projects p
 		JOIN topics t ON t.project_id = p.id
-		WHERE p.name = 'Agent Sessions' AND t.agent_type = ?
-		LIMIT 1
+		WHERE p.workspace_id = 1 AND p.name = 'Agent Sessions' AND t.agent_type = ?
+		ORDER BY p.id ASC LIMIT 1
 	`, agentType).Scan(&projID, &topicID)
 	if err != nil {
 		return nil, fmt.Errorf("find inspiration topic for %s: %w", agentType, err)

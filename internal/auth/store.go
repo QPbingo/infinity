@@ -65,14 +65,21 @@ func (s *Store) Login(username, password string) (*User, error) {
 		`SELECT id, username, password, created_at FROM users WHERE username = ?`,
 		username,
 	).Scan(&user.ID, &user.Username, &hash, &user.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrInvalidCredentials
-	}
-	if err != nil {
+	notFound := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !notFound {
 		return nil, fmt.Errorf("query user: %w", err)
 	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+	// Always run bcrypt — even for non-existent users — to prevent
+	// timing-based username enumeration.
+	candidateHash := hash
+	if notFound {
+		candidateHash = "$2a$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	}
+	bcryptErr := bcrypt.CompareHashAndPassword([]byte(candidateHash), []byte(password))
+	if notFound {
+		return nil, ErrInvalidCredentials
+	}
+	if bcryptErr != nil {
 		return nil, ErrInvalidCredentials
 	}
 
@@ -108,8 +115,8 @@ func (s *Store) CreateToken(userID int64) (string, error) {
 // WebAuth auto-renews tokens that are within renewThresholdms of expiry, so
 // active users effectively never see a mid-session logout.
 const (
-	tokenTTLms         = 7 * 24 * 60 * 60 * 1000 // 7 days
-	renewThresholdms   = 24 * 60 * 60 * 1000     // renew if <1 day left
+	tokenTTLms       = 7 * 24 * 60 * 60 * 1000 // 7 days
+	renewThresholdms = 24 * 60 * 60 * 1000     // renew if <1 day left
 )
 
 // ValidateToken returns the user for a raw token. It does NOT renew the token;

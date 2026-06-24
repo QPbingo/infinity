@@ -68,7 +68,9 @@ class HierarchyStore extends Store {
   }
 
   toggleNode(key: string): void {
-    this.expandedNodes[key] = !this.expandedNodes[key]
+    // Default to expanded (true); first click collapses.
+    const current = this.expandedNodes[key] !== false
+    this.expandedNodes[key] = !current
     this.notify()
   }
 }

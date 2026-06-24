@@ -37,12 +37,13 @@ export type SessionStatusFilter = 'all' | SessionStatus | 'claude' | 'opencode' 
 class SessionsStore extends Store {
   sessions: Record<string, Session> = {}
   currentFilter: SessionStatusFilter = 'all'
-  agentTypeFilter: string = ''  // '' = all agent types
+  agentTypeFilter: string = ''
+  selectedSessionKey: string | null = null  // '' = all agent types
   expandedCards: Record<string, boolean> = {}
   expandedTurns: Record<string, boolean> = {}
   expandedToolGroups: Record<string, boolean> = {}
   expandedPayloads: Record<string, boolean> = {}
-  // User's draft input per session — preserved across SSE-driven repaints
+// User's draft input per session — preserved across SSE-driven repaints
   // so they don't lose what they typed when a delta lands mid-keystroke.
   draftInputs: Record<string, string> = {}
   // Timeline search/filter state per session — keyed by session_key.
@@ -133,6 +134,11 @@ class SessionsStore extends Store {
 
   toggleToolGroup(key: string, turnIdx: number, entryIdx: number): void {
     const id = `${key}_${turnIdx}_${entryIdx}`
+    this.expandedToolGroups[id] = !this.expandedToolGroups[id]
+    this.notify()
+  }
+
+  toggleToolDetail(id: string): void {
     this.expandedToolGroups[id] = !this.expandedToolGroups[id]
     this.notify()
   }

@@ -45,7 +45,7 @@ func NewSSEHub(sessions *session.SessionManager, hierStore *hierarchy.Store, aut
 		agentMgr:   agentMgr,
 		register:   make(chan *SSEClient),
 		unregister: make(chan *SSEClient),
-		broadcast:  make(chan []byte, 256),
+		broadcast:  make(chan interface{}, 256),
 	}
 }
 
@@ -58,7 +58,7 @@ type SSEHub struct {
 	agentMgr   *sdk.AgentManager
 	register   chan *SSEClient
 	unregister chan *SSEClient
-	broadcast  chan []byte
+	broadcast  chan interface{}
 }
 
 // Run is the hub event loop. Must run in its own goroutine.
@@ -76,9 +76,13 @@ func (h *SSEHub) Run() {
 				close(c.send)
 			}
 			h.mu.Unlock()
-		case msg := <-h.broadcast:
+		case raw := <-h.broadcast:
 			h.mu.Lock()
 			for c := range h.clients {
+				msg, ok := h.messageForClient(raw, c)
+				if !ok {
+					continue
+				}
 				select {
 				case c.send <- msg:
 				default:
@@ -95,36 +99,24 @@ func (h *SSEHub) Run() {
 // Notify serializes a session/hierarchy event and broadcasts it to all clients.
 // Called by SessionManager via SetNotify / SetHierarchyNotify.
 func (h *SSEHub) Notify(eventType string, data interface{}) {
-	var msg map[string]interface{}
 	switch eventType {
 	case "delta":
 		d, ok := data.(*session.Delta)
 		if !ok {
 			return
 		}
-		msg = map[string]interface{}{
-			"type":         "delta",
-			"session_key":  d.SessionKey,
-			"changes":      d.Changes,
-			"timestamp_ms": d.TimestampMs,
-		}
+		h.broadcast <- scopedSSEEvent{kind: eventType, data: d}
 	case "session_added":
 		s, ok := data.(*session.Session)
 		if !ok {
 			return
 		}
-		msg = map[string]interface{}{"type": "session_added", "session": s}
+		h.broadcast <- scopedSSEEvent{kind: eventType, data: s}
 	case "hierarchy_updated":
-		msg = map[string]interface{}{"type": "hierarchy_updated", "hierarchy": data}
+		h.broadcast <- scopedSSEEvent{kind: eventType}
 	default:
 		return
 	}
-	b, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("[sse] marshal notify: %v", err)
-		return
-	}
-	h.broadcast <- b
 }
 
 // BroadcastAgent sends an agent-execution event (agent_exec_started /
@@ -138,6 +130,57 @@ func (h *SSEHub) BroadcastAgent(payload map[string]interface{}) {
 		return
 	}
 	h.broadcast <- b
+}
+
+type scopedSSEEvent struct {
+	kind string
+	data interface{}
+}
+
+func (h *SSEHub) messageForClient(raw interface{}, c *SSEClient) ([]byte, bool) {
+	switch msg := raw.(type) {
+	case []byte:
+		return msg, true
+	case scopedSSEEvent:
+		if c.user == nil {
+			return nil, false
+		}
+		var payload map[string]interface{}
+		switch msg.kind {
+		case "delta":
+			d, ok := msg.data.(*session.Delta)
+			if !ok {
+				return nil, false
+			}
+			sess := h.sessions.GetSession(d.SessionKey)
+			if !userCanAccessSession(h.hierStore, c.user.ID, sess) {
+				return nil, false
+			}
+			payload = map[string]interface{}{"type": "delta", "session_key": d.SessionKey, "changes": d.Changes, "timestamp_ms": d.TimestampMs}
+		case "session_added":
+			s, ok := msg.data.(*session.Session)
+			if !ok || !userCanAccessSession(h.hierStore, c.user.ID, s) {
+				return nil, false
+			}
+			payload = map[string]interface{}{"type": "session_added", "session": s}
+		case "hierarchy_updated":
+			tree, err := scopedHierarchyForUser(h.hierStore, c.user.ID)
+			if err != nil {
+				return nil, false
+			}
+			payload = map[string]interface{}{"type": "hierarchy_updated", "hierarchy": tree}
+		default:
+			return nil, false
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[sse] marshal scoped notify: %v", err)
+			return nil, false
+		}
+		return b, true
+	default:
+		return nil, false
+	}
 }
 
 // BroadcastExecutions sends the full execution history to a single client
@@ -169,6 +212,11 @@ func (h *SSEHub) HandleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
 		return
 	}
+	user := auth.GetUser(r)
+	if user == nil {
+		http.Error(w, `{"error":"auth required"}`, http.StatusUnauthorized)
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -182,6 +230,7 @@ func (h *SSEHub) HandleStream(w http.ResponseWriter, r *http.Request) {
 		w:       w,
 		flusher: flusher,
 		send:    make(chan []byte, sseSendBufSize),
+		user:    user,
 	}
 
 	// B: register BEFORE sending the initial snapshot so deltas produced
@@ -225,18 +274,29 @@ func (h *SSEHub) HandleStream(w http.ResponseWriter, r *http.Request) {
 func (h *SSEHub) sendInitial(c *SSEClient) {
 	// Session snapshot
 	snap := h.sessions.GetSnapshot()
+	sessions := snap.Sessions
+	if c.user != nil {
+		sessions = filterSessionsForUser(h.hierStore, c.user.ID, sessions)
+	}
 	c.writeJSON(map[string]interface{}{
 		"type":        "snapshot",
-		"sessions":    snap.Sessions,
+		"sessions":    sessions,
 		"gen_time_ms": snap.GenTimeMs,
 	})
 
 	// Hierarchy snapshot
 	if h.hierStore != nil {
-		if tree, err := h.hierStore.GetFullHierarchy(); err == nil {
+		if c.user != nil {
+			if tree, err := scopedHierarchyForUser(h.hierStore, c.user.ID); err == nil {
+				c.writeJSON(map[string]interface{}{
+					"type":      "hierarchy_snapshot",
+					"hierarchy": tree,
+				})
+			}
+		} else {
 			c.writeJSON(map[string]interface{}{
 				"type":      "hierarchy_snapshot",
-				"hierarchy": tree,
+				"hierarchy": &hierarchy.HierarchyTree{},
 			})
 		}
 	}
@@ -255,6 +315,7 @@ type SSEClient struct {
 	flusher http.Flusher
 	send    chan []byte
 	writeMu sync.Mutex
+	user    *auth.User
 }
 
 // write writes a raw SSE event payload (already JSON) under the mutex and

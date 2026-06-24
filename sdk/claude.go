@@ -28,11 +28,11 @@ type activeProcess struct {
 }
 
 type ClaudeSDK struct {
-	binPath   string
-	activeMu  sync.Mutex
-	active    map[string]*activeProcess // execID → running subprocess
+	binPath    string
+	activeMu   sync.Mutex
+	active     map[string]*activeProcess // execID → running subprocess
 	sessionsMu sync.RWMutex
-	sessions  map[string]*Session
+	sessions   map[string]*Session
 }
 
 // ClaudeOptions configures the Claude Code CLI integration.
@@ -71,19 +71,24 @@ func (c *ClaudeSDK) CreateSession(ctx context.Context, opts SessionOptions) (*Se
 		CreatedAt: time.Now(),
 		Options:   opts,
 	}
-	c.sessionsMu.Lock(); c.sessions[id] = sess; c.sessionsMu.Unlock()
+	c.sessionsMu.Lock()
+	c.sessions[id] = sess
+	c.sessionsMu.Unlock()
 	return sess, nil
 }
 
 // SendPrompt sends a prompt by spawning a Claude CLI subprocess.
 //
 // The subprocess is launched with:
-//   claude -p "<prompt>" --output-format stream-json [--resume <id>] [--model <m>] ...
+//
+//	claude -p "<prompt>" --output-format stream-json [--resume <id>] [--model <m>] ...
 //
 // Output lines are parsed as JSON and emitted as Message chunks on the
 // returned channel. The channel closes when the subprocess exits.
 func (c *ClaudeSDK) SendPrompt(ctx context.Context, sessionID string, prompt string) (<-chan Message, error) {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.RLock()
+	sess, ok := c.sessions[sessionID]
+	c.sessionsMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("claude: session %s not found", sessionID)
 	}
@@ -94,9 +99,9 @@ func (c *ClaudeSDK) SendPrompt(ctx context.Context, sessionID string, prompt str
 		defer close(ch)
 		execID := generateExecID()
 
-
 		args := c.buildArgs(sess, prompt)
 		cmd := exec.CommandContext(ctx, c.binPath, args...)
+		defer cmd.Wait() // ensure process is reaped even on early return (cancellation)
 		if sess.Options.CWD != "" {
 			cmd.Dir = sess.Options.CWD
 		}
@@ -153,10 +158,10 @@ func (c *ClaudeSDK) SendPrompt(ctx context.Context, sessionID string, prompt str
 		}
 
 		if err := cmd.Wait(); err != nil {
-				if ctx.Err() == nil {
-					ch <- Message{Type: MessageTypeError, Error: err.Error(), IsFinal: true, Timestamp: time.Now()}
-				}
+			if ctx.Err() == nil {
+				ch <- Message{Type: MessageTypeError, Error: err.Error(), IsFinal: true, Timestamp: time.Now()}
 			}
+		}
 	}()
 
 	return ch, nil
@@ -268,7 +273,9 @@ func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) M
 // ResumeSession returns metadata for an existing session.
 // Context is automatically restored on the next SendPrompt via --resume.
 func (c *ClaudeSDK) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.Lock()
+	sess, ok := c.sessions[sessionID]
+	c.sessionsMu.Unlock()
 	if !ok {
 		// Session was created externally (e.g., CLI). Create a minimal record.
 		sess = &Session{
@@ -276,7 +283,9 @@ func (c *ClaudeSDK) ResumeSession(ctx context.Context, sessionID string) (*Sessi
 			AgentType: AgentClaude,
 			CreatedAt: time.Now(),
 		}
+		c.sessionsMu.Lock()
 		c.sessions[sessionID] = sess
+		c.sessionsMu.Unlock()
 	}
 	return sess, nil
 }
@@ -300,7 +309,9 @@ func (c *ClaudeSDK) CancelExecution(ctx context.Context, sessionID string) error
 // RenameSession is not natively supported by Claude Code CLI.
 // The session title is stored in-memory only.
 func (c *ClaudeSDK) RenameSession(ctx context.Context, sessionID string, title string) error {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.Lock()
+	defer c.sessionsMu.Unlock()
+	sess, ok := c.sessions[sessionID]
 	if !ok {
 		return fmt.Errorf("claude: session %s not found", sessionID)
 	}
@@ -330,7 +341,9 @@ func (c *ClaudeSDK) ListSessions(ctx context.Context, dir string) ([]SessionInfo
 
 // SetPermissionMode updates the permission mode for future turns.
 func (c *ClaudeSDK) SetPermissionMode(sessionID string, mode PermissionMode) error {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.Lock()
+	defer c.sessionsMu.Unlock()
+	sess, ok := c.sessions[sessionID]
 	if !ok {
 		return fmt.Errorf("claude: session %s not found", sessionID)
 	}

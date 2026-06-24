@@ -16,6 +16,7 @@ import (
 // for the same session will UPDATE the existing row via ON CONFLICT DO UPDATE.
 //
 // Column design:
+//
 //   - Identity columns (user_id, device_id, agent_type, agent_session_id):
 //     Together form the primary key. Never change once a session is created.
 //
@@ -130,6 +131,11 @@ func NewStore(dbPath string) (*Store, error) {
 
 	db.SetMaxOpenConns(1)
 
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+
 	if _, err := db.Exec(createTableSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create table: %w", err)
@@ -195,9 +201,9 @@ func (s *Store) Upsert(sess *Session) error {
 			pid, terminal, cwd, status, start_time_ms,
 			last_event_time_ms, last_event_type, last_file, last_command,
 			user_input, agent_output, session_title, payload, last_hook_event,
-			memory_mb, cpu_percent, turn_count, turns, git_branch,
+			memory_mb, cpu_percent, turn_count, turns, git_branch, story_id,
 			created_at, updated_at, ended_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, device_id, agent_type, agent_session_id) DO UPDATE SET
 			session_key = excluded.session_key,
 			pid = excluded.pid,
@@ -219,6 +225,7 @@ func (s *Store) Upsert(sess *Session) error {
 			turn_count = excluded.turn_count,
 			turns = excluded.turns,
 			git_branch = excluded.git_branch,
+			story_id = excluded.story_id,
 			updated_at = excluded.updated_at,
 			ended_at = excluded.ended_at
 	`,
@@ -227,6 +234,7 @@ func (s *Store) Upsert(sess *Session) error {
 		sess.LastEventTimeMs, sess.LastEventType, sess.LastFile, sess.LastCommand,
 		sess.UserInput, sess.AgentOutput, sess.SessionTitle, payload, sess.LastHookEvent,
 		sess.MemoryMB, sess.CPUPercent, sess.TurnCount, turnsJSON, sess.GitBranch,
+		sess.StoryID,
 		now, now, endedAt,
 	)
 	return err
@@ -235,15 +243,16 @@ func (s *Store) Upsert(sess *Session) error {
 // UpdateProcessFields updates only process-level metrics in the database.
 //
 // This is a lighter UPDATE compared to Upsert() – it only changes:
-//   pid, terminal, cwd, memory_mb, cpu_percent, updated_at
+//
+//	pid, terminal, cwd, memory_mb, cpu_percent, updated_at
 //
 // It does NOT touch: status, hook event data, content fields, ended_at.
 //
 // This reduces write contention because:
-//   1. Fewer columns updated → smaller WAL entries.
-//   2. Hook events (Upsert) and process scans (UpdateProcessFields) touch
-//      different columns, reducing SQLite page-level conflicts.
-//   3. updated_at timestamp is still refreshed to show liveness.
+//  1. Fewer columns updated → smaller WAL entries.
+//  2. Hook events (Upsert) and process scans (UpdateProcessFields) touch
+//     different columns, reducing SQLite page-level conflicts.
+//  3. updated_at timestamp is still refreshed to show liveness.
 //
 // Called by HandlePidUpdate() on every PID scan cycle where process
 // metrics changed meaningfully.
@@ -296,7 +305,7 @@ func (s *Store) LoadAll() ([]*Session, error) {
 	for rows.Next() {
 		var s Session
 		var userInput, agentOutput, sessionTitle, payload, lastHookEvent, turnsJSON string
-			var storyID sql.NullInt64
+		var storyID sql.NullInt64
 		if err := rows.Scan(
 			&s.UserID, &s.DeviceID, &s.AgentType, &s.AgentSessionID, &s.SessionKey,
 			&s.PID, &s.Terminal, &s.CWD, &s.Status, &s.StartTimeMs,

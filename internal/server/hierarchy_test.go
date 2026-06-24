@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,8 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/heybox/agent-monitor/internal/auth"
+	"github.com/heybox/agent-monitor/internal/hierarchy"
+	"github.com/heybox/agent-monitor/internal/session"
 )
 
 // ── Multi-user fixture ──
@@ -431,4 +435,161 @@ func TestPERM_05_ListUsers(t *testing.T) {
 	if len(users) < 3 {
 		t.Fatalf("PERM-05: user count=%d, want >=3 (A/B/C)", len(users))
 	}
+}
+
+func TestAUTH_HierarchyNoPermissionReturnsEmptyTree(t *testing.T) {
+	mu := setupMultiUser(t)
+	resp := authedGet(mu.server.URL, "/api/hierarchy", mu.cookieB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("hierarchy status=%d, want 200", resp.StatusCode)
+	}
+	var tree struct {
+		Workspaces []struct{} `json:"workspaces"`
+	}
+	json.NewDecoder(resp.Body).Decode(&tree)
+	resp.Body.Close()
+	if len(tree.Workspaces) != 0 {
+		t.Fatalf("B hierarchy workspaces=%d, want 0", len(tree.Workspaces))
+	}
+}
+
+func TestAUTH_ProjectPermissionDoesNotExposeSiblingProjects(t *testing.T) {
+	mu := setupMultiUser(t)
+	resp := authedPost(mu.server.URL, "/api/workspaces/"+itoa(mu.wsID)+"/projects", `{"name":"private","description":""}`, mu.cookieA)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sibling project status=%d", resp.StatusCode)
+	}
+	var sibling struct{ ID int64 `json:"id"` }
+	json.NewDecoder(resp.Body).Decode(&sibling)
+	resp.Body.Close()
+
+	resp = authedPut(mu.server.URL, "/api/permissions/project/"+itoa(mu.projID), fmt.Sprintf(`{"user_id":%d,"level":10}`, mu.uidB), mu.cookieA)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("grant B project viewer status=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authedGet(mu.server.URL, "/api/hierarchy", mu.cookieB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("hierarchy status=%d", resp.StatusCode)
+	}
+	var tree struct {
+		Workspaces []struct {
+			Projects []struct {
+				Project struct{ ID int64 `json:"id"` } `json:"project"`
+			} `json:"projects"`
+		} `json:"workspaces"`
+	}
+	json.NewDecoder(resp.Body).Decode(&tree)
+	resp.Body.Close()
+
+	var got []int64
+	for _, ws := range tree.Workspaces {
+		for _, p := range ws.Projects {
+			got = append(got, p.Project.ID)
+		}
+	}
+	if len(got) != 1 || got[0] != mu.projID {
+		t.Fatalf("B visible project IDs=%v, want only [%d]", got, mu.projID)
+	}
+	_ = sibling
+}
+
+func TestAUTH_PermissionListsRequireAdmin(t *testing.T) {
+	mu := setupMultiUser(t)
+	resp := authedGet(mu.server.URL, "/api/permissions/workspace/"+itoa(mu.wsID), mu.cookieB)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("B list workspace perms status=%d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authedGet(mu.server.URL, "/api/permissions/project/"+itoa(mu.projID), mu.cookieB)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("B list project perms status=%d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authedGet(mu.server.URL, "/api/users", mu.cookieB)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("B list users status=%d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestAUTH_SessionInputRequiresProjectAccess(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	store, err := session.NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("session store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	db, err := store.DB()
+	if err != nil {
+		t.Fatalf("db: %v", err)
+	}
+	mgr := session.NewSessionManager(store, "local", "device-1")
+	authStore := auth.NewStore(db)
+	if err := authStore.EnsureTables(); err != nil {
+		t.Fatalf("auth tables: %v", err)
+	}
+	hierStore := hierarchy.NewStore(db)
+	if err := hierStore.EnsureTables(); err != nil {
+		t.Fatalf("hier tables: %v", err)
+	}
+	if _, _, err := hierStore.EnsureInspiration(); err != nil {
+		t.Fatalf("ensure inspiration: %v", err)
+	}
+	mgr.SetHierarchyStore(hierStore)
+	realSrv := New("127.0.0.1:0", mgr, "daemon-tok", authStore, hierStore, nil, "http://localhost:5173")
+	realSrv.Start()
+	t.Cleanup(realSrv.Shutdown)
+	ts := httptest.NewServer(realSrv.httpSrv.Handler)
+	t.Cleanup(ts.Close)
+	mgr.HandleEvent(&session.HookEvent{Event: "SessionStart", AgentType: "claude", SessionID: "s-auth", TimestampMs: time.Now().UnixMilli()})
+	key := session.ComputeSessionKey(mgr.UserID(), mgr.DeviceID(), "claude", "s-auth")
+
+	// Register a second user with no permissions and verify they cannot send
+	// input to the session.
+	reg, err := http.Post(ts.URL+"/api/auth/register", "application/json", strings.NewReader(`{"username":"outsider","password":"pw"}`))
+	if err != nil {
+		t.Fatalf("register outsider: %v", err)
+	}
+	var cookieB string
+	for _, c := range reg.Cookies() {
+		if c.Name == auth.SessionCookieName {
+			cookieB = c.Value
+		}
+	}
+	reg.Body.Close()
+
+	resp := authedPost(ts.URL, "/api/sessions/"+key+"/input", `{"text":"hack"}`, cookieB)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("outsider input status=%d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestAUTH_SSEInitialHierarchyIsScoped(t *testing.T) {
+	mu := setupMultiUser(t)
+	resp := authedGet(mu.server.URL, "/api/events/stream", mu.cookieB)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d, want 200", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+
+	br := bufio.NewReader(resp.Body)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.Contains(line, `"type":"hierarchy_snapshot"`) {
+			if !strings.Contains(line, `"workspaces":[]`) {
+				t.Fatalf("B hierarchy snapshot not scoped: %s", line)
+			}
+			return
+		}
+	}
+	t.Fatalf("did not receive hierarchy_snapshot")
 }

@@ -49,9 +49,25 @@ export function showEditStoryModal(storyId: number, currentName: string): void {
     </div>`
   overlay.style.display = 'flex'
   bindModalCancel('modal-cancel')
-  bindEnter('modal-name', () => onEditStory(storyId))
+  const doSave = async () => {
+    const name = (document.getElementById('modal-name') as HTMLInputElement)?.value.trim() ?? ''
+    if (!name) { toast.warn('Name is required'); return }
+    const btn = document.getElementById('modal-create') as HTMLButtonElement | null
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…' }
+    try {
+      await updateStory(storyId, name)
+      closeModal()
+      await refreshHierarchy()
+      toast.ok('Story renamed')
+    } catch (e) {
+      toast.error('Rename failed: ' + ((e as Error).message || 'unknown'))
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Save' }
+    }
+  }
+  bindEnter('modal-name', doSave)
   const saveBtn = document.getElementById('modal-create')
-  if (saveBtn) saveBtn.onclick = () => onEditStory(storyId)
+  if (saveBtn) saveBtn.onclick = doSave
 }
 
 export function showDeleteStoryModal(storyId: number, name: string): void {
@@ -94,6 +110,8 @@ export function closeModal(): void {
 async function doCreate(type: 'workspace' | 'project' | 'topic', parentId: number): Promise<void> {
   const name = (document.getElementById('modal-name') as HTMLInputElement)?.value.trim() ?? ''
   if (!name) { toast.warn('Name is required'); return }
+  const btn = document.getElementById('modal-create') as HTMLButtonElement | null
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating…' }
   const wid = hierarchyStore.selectedWorkspaceId ?? 1
   try {
     switch (type) {
@@ -146,6 +164,10 @@ async function doCreateStory(topicId: number): Promise<void> {
       if (proj.topics?.some((t) => t.topic.id === topicId)) { pid = proj.project.id; break }
     }
   }
+  if (!pid) {
+    toast.error('Topic not found — refresh and try again')
+    return
+  }
   try {
     await createStory(wid, pid, topicId, name)
     closeModal()
@@ -157,7 +179,6 @@ async function doCreateStory(topicId: number): Promise<void> {
 }
 
 export async function onEditStory(id: number): Promise<void> {
-  // Find current name from the hierarchy tree.
   let currentName = ''
   for (const ws of hierarchyStore.tree?.workspaces ?? []) {
     for (const proj of ws.projects ?? []) {
@@ -168,22 +189,6 @@ export async function onEditStory(id: number): Promise<void> {
     }
   }
   showEditStoryModal(id, currentName)
-  // Wire the save button from inside the modal.
-  const saveBtn = document.getElementById('modal-create')
-  if (saveBtn) {
-    saveBtn.onclick = async () => {
-      const name = (document.getElementById('modal-name') as HTMLInputElement)?.value.trim() ?? ''
-      if (!name) { toast.warn('Name is required'); return }
-      try {
-        await updateStory(id, name)
-        closeModal()
-        await refreshHierarchy()
-        toast.ok('Story renamed')
-      } catch (e) {
-        toast.error('Rename failed: ' + ((e as Error).message || 'unknown'))
-      }
-    }
-  }
 }
 
 export async function onDeleteStory(id: number): Promise<void> {

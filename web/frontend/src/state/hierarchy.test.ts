@@ -45,10 +45,12 @@ describe('hierarchyStore', () => {
   })
 
   it('toggleNode flips expansion state', () => {
-    hierarchyStore.toggleNode('ws_1')
-    expect(hierarchyStore.expandedNodes['ws_1']).toBe(true)
+    // Default (undefined) is treated as expanded by the render layer.
+    // First click collapses, second expands.
     hierarchyStore.toggleNode('ws_1')
     expect(hierarchyStore.expandedNodes['ws_1']).toBe(false)
+    hierarchyStore.toggleNode('ws_1')
+    expect(hierarchyStore.expandedNodes['ws_1']).toBe(true)
   })
 
   it('setTree defaults to first workspace if none selected', () => {

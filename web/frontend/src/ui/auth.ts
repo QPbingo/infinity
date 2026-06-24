@@ -97,8 +97,6 @@ export function showApp(): void {
   const app = document.getElementById('app')
   if (overlay) overlay.style.display = 'none'
   if (app) app.classList.add('is-ready')
-  const name = document.getElementById('user-name')
-  if (name && authStore.user) name.textContent = authStore.user.username
 }
 
 // restoreSession: on page load, ask the backend whether the cookie is still

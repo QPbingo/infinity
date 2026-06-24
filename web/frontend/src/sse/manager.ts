@@ -64,6 +64,7 @@ export class SSEManager {
   private followerWait: ReturnType<typeof setTimeout> | null = null
   private isLeader = false
   private disposed = false
+  private closeRetries = 0
 
   constructor() {
     this.initBroadcastChannel()
@@ -148,6 +149,7 @@ export class SSEManager {
     }
 
     this.es.onopen = () => {
+      this.closeRetries = 0
       sseStatusBus.set('connected')
       this.resetDeadTimer()
     }
@@ -164,11 +166,18 @@ export class SSEManager {
     }
 
     this.es.onerror = () => {
-      // CLOSED state → assume auth failure (server returned 401 and gave up).
+      // CLOSED may be a transient network blip / daemon restart, not
+      // necessarily auth failure. Retry a few times before giving up.
       if (this.es?.readyState === 2) {
         this.clearDeadTimer()
-        sseStatusBus.set('disconnected')
-        this.dispatch({ type: 'agent_error', error: 'sse_closed', __auth: true } as SSEEvent)
+        this.closeRetries = (this.closeRetries || 0) + 1
+        if (this.closeRetries >= 3) {
+          sseStatusBus.set('disconnected')
+          this.dispatch({ type: 'agent_error', error: 'sse_closed', __auth: true } as SSEEvent)
+          return
+        }
+        sseStatusBus.set('connecting')
+        setTimeout(() => this.openEventSource(), 1500)
         return
       }
       // CONNECTING state → EventSource is retrying; just mark us as connecting.

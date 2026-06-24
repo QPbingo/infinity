@@ -10,6 +10,11 @@ import (
 	"github.com/heybox/agent-monitor/internal/scanner"
 )
 
+const (
+	maxTurnsPerSession   = 500
+	maxAgentOutputLength = 100000
+)
+
 type NotifyFunc func(eventType string, data interface{})
 
 type SessionManager struct {
@@ -35,11 +40,11 @@ func NewSessionManager(store *Store, userID, deviceID string) *SessionManager {
 	}
 }
 
-func (sm *SessionManager) SetNotify(fn NotifyFunc)        { sm.notify = fn }
-func (sm *SessionManager) SetHierarchyStore(h *hierarchy.Store)       { sm.hierStore = h }
-func (sm *SessionManager) SetHierarchyNotify(fn NotifyFunc)            { sm.hierNotify = fn }
-func (sm *SessionManager) UserID() string               { return sm.userID }
-func (sm *SessionManager) DeviceID() string             { return sm.deviceID }
+func (sm *SessionManager) SetNotify(fn NotifyFunc)              { sm.notify = fn }
+func (sm *SessionManager) SetHierarchyStore(h *hierarchy.Store) { sm.hierStore = h }
+func (sm *SessionManager) SetHierarchyNotify(fn NotifyFunc)     { sm.hierNotify = fn }
+func (sm *SessionManager) UserID() string                       { return sm.userID }
+func (sm *SessionManager) DeviceID() string                     { return sm.deviceID }
 
 func (sm *SessionManager) LoadFromStore() {
 	sessions, err := sm.store.LoadAll()
@@ -52,6 +57,25 @@ func (sm *SessionManager) LoadFromStore() {
 	for _, s := range sessions {
 		if _, exists := sm.sessions[s.SessionKey]; !exists {
 			sm.sessions[s.SessionKey] = s
+		}
+	}
+	// Reconcile story links for sessions loaded from store that may not
+	// have been auto-assigned to hierarchy stories.
+	for _, s := range sm.sessions {
+		if s.StoryID == nil && s.AgentType != "" && s.AgentSessionID != "" && sm.hierStore != nil {
+			title := s.SessionTitle
+			if title == "" {
+				title = s.AgentSessionID
+			}
+			story, err := sm.hierStore.FindOrCreateInspirationStory(s.AgentType, s.SessionKey, title)
+			if err != nil {
+				log.Printf("[session] reconcile story link for %s: %v", s.SessionKey, err)
+			} else {
+				s.StoryID = &story.ID
+				if sm.store != nil {
+					sm.store.Upsert(s)
+				}
+			}
 		}
 	}
 	log.Printf("[session] loaded %d sessions from store", len(sessions))
@@ -82,24 +106,24 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		sm.sessions[key] = sess
 		sess.applyEvent(event, handler)
 
-			// Auto-assign to inspiration project
-			if sm.hierStore != nil {
-				title := sess.SessionTitle
-				if title == "" {
-					title = sess.AgentSessionID
-				}
-				story, err := sm.hierStore.FindOrCreateInspirationStory(event.AgentType, key, title)
-				if err != nil {
-					log.Printf("[session] auto-assign story: %v", err)
-				} else {
-					sess.StoryID = &story.ID
-					if sm.hierNotify != nil {
-						if tree, err := sm.hierStore.GetFullHierarchy(); err == nil {
-							sm.hierNotify("hierarchy_updated", tree)
-						}
+		// Auto-assign to inspiration project
+		if sm.hierStore != nil {
+			title := sess.SessionTitle
+			if title == "" {
+				title = sess.AgentSessionID
+			}
+			story, err := sm.hierStore.FindOrCreateInspirationStory(event.AgentType, key, title)
+			if err != nil {
+				log.Printf("[session] auto-assign story: %v", err)
+			} else {
+				sess.StoryID = &story.ID
+				if sm.hierNotify != nil {
+					if tree, err := sm.hierStore.GetFullHierarchy(); err == nil {
+						sm.hierNotify("hierarchy_updated", tree)
 					}
 				}
 			}
+		}
 
 		if sm.store != nil {
 			if err := sm.store.Upsert(sess); err != nil {
@@ -125,7 +149,8 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 	}
 
 	sess.applyEvent(event, handler)
-
+	// Cap unbounded growth of turns and agent output.
+	sess.capGrowth()
 	if sm.store != nil {
 		if err := sm.store.Upsert(sess); err != nil {
 			log.Printf("[session] upsert session: %v", err)
@@ -153,7 +178,7 @@ func (s *Session) applyEvent(event *HookEvent, handler AgentHandler) {
 	handler.OnEvent(s, event)
 
 	// Promote to active unless already in a terminal state.
-	if s.Status != StatusError && s.Status != StatusStopped {
+	if s.Status != StatusError && s.Status != StatusStopped && s.Status != StatusDisappeared {
 		s.Status = StatusActive
 	}
 }
@@ -263,11 +288,9 @@ func (s *Session) failTool(event *HookEvent, handler AgentHandler) {
 	toolName := handler.ExtractToolName(event.Payload)
 	toolOutput := handler.ExtractToolOutput(event.Payload)
 	reason := extractStringField(event.Payload, "reason", "error", "message")
-	if toolName == "" {
-		return
-	}
 	s.ensureTurn()
 	turn := s.ensureTurn()
+	// Match first running tool when toolName is empty, consistent with completeTool.
 	for i := len(turn.Entries) - 1; i >= 0; i-- {
 		entry := &turn.Entries[i]
 		for j := len(entry.Tools) - 1; j >= 0; j-- {
@@ -596,11 +619,17 @@ func (sm *SessionManager) HandlePidUpdate(key string, info *scanner.ProcessInfo)
 		sess.Status = StatusActive
 		sess.lastHookTime = time.Now().UnixMilli()
 		changed = true
+		// Use Upsert to also persist the status change, not just process fields.
+		if sm.store != nil {
+			if err := sm.store.Upsert(sess); err != nil {
+				log.Printf("[session] upsert resurrect: %v", err)
+			}
+		}
 	}
 	if !changed {
 		return
 	}
-	if sm.store != nil {
+	if sm.store != nil && sess.Status != StatusActive {
 		if err := sm.store.UpdateProcessFields(sess); err != nil {
 			log.Printf("[session] update process fields: %v", err)
 		}
@@ -632,8 +661,8 @@ func (sm *SessionManager) MarkDisappeared(key string) {
 	}
 	if sm.notify != nil {
 		sm.notify("delta", &Delta{
-			SessionKey: key,
-			Changes:    map[string]interface{}{"status": string(StatusDisappeared)},
+			SessionKey:  key,
+			Changes:     map[string]interface{}{"status": string(StatusDisappeared)},
 			TimestampMs: time.Now().UnixMilli(),
 		})
 	}
@@ -654,10 +683,15 @@ func (sm *SessionManager) CheckIdleSessions() {
 		if now-sess.lastHookTime > idleThreshold {
 			if sess.Status != StatusIdle {
 				sess.Status = StatusIdle
+				if sm.store != nil {
+					if err := sm.store.Upsert(sess); err != nil {
+						log.Printf("[session] upsert idle: %v", err)
+					}
+				}
 				if sm.notify != nil {
 					sm.notify("delta", &Delta{
-						SessionKey: key,
-						Changes:    map[string]interface{}{"status": string(StatusIdle)},
+						SessionKey:  key,
+						Changes:     map[string]interface{}{"status": string(StatusIdle)},
 						TimestampMs: now,
 					})
 				}
@@ -867,4 +901,17 @@ func abs(x float64) float64 {
 		return -x
 	}
 	return x
+}
+
+func (s *Session) capGrowth() {
+	if len(s.Turns) > maxTurnsPerSession {
+		shift := len(s.Turns) - maxTurnsPerSession
+		s.Turns = s.Turns[shift:]
+		for i := range s.Turns {
+			s.Turns[i].TurnIdx = i
+		}
+	}
+	if len(s.AgentOutput) > maxAgentOutputLength {
+		s.AgentOutput = s.AgentOutput[len(s.AgentOutput)-maxAgentOutputLength:]
+	}
 }

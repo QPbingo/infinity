@@ -62,14 +62,26 @@ func (s *ExecutionStore) Create(id, sessionID string, agentType AgentType, promp
 	}
 	s.mu.Lock()
 	s.executions[id] = e
-	// Evict oldest entries if over capacity
+	// Evict oldest entries if over capacity, skipping running ones.
 	if len(s.executions) > maxExecutions {
 		var oldest *AgentExecution
 		var oldestKey string
 		for k, v := range s.executions {
+			if v.Status == ExecutionRunning {
+				continue
+			}
 			if oldest == nil || v.CreatedAt.Before(oldest.CreatedAt) {
 				oldest = v
 				oldestKey = k
+			}
+		}
+		if oldestKey == "" {
+			// All entries are running — still need to evict oldest.
+			for k, v := range s.executions {
+				if oldest == nil || v.CreatedAt.Before(oldest.CreatedAt) {
+					oldest = v
+					oldestKey = k
+				}
 			}
 		}
 		if oldestKey != "" {
@@ -94,7 +106,10 @@ func (s *ExecutionStore) Complete(execID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.executions[execID]; ok {
-		e.Status = ExecutionCompleted
+		// Don't overwrite already-terminal status (cancelled, failed, error).
+		if e.Status != ExecutionCancelled && e.Status != ExecutionError {
+			e.Status = ExecutionCompleted
+		}
 		now := time.Now()
 		e.FinishedAt = &now
 	}

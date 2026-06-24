@@ -71,14 +71,20 @@ describe('SSEManager', () => {
     expect(es.readyState).toBe(2)
   })
 
-  it('dispatches auth-failure on CLOSED error (SSE-F03, constraint D)', async () => {
+  it('dispatches auth-failure after 3 CLOSED errors (SSE-F03, constraint D, with retry)', async () => {
     const mgr = new SSEManager()
     const handler = vi.fn()
     mgr.on(handler)
     mgr.connect()
     await new Promise((r) => setTimeout(r, 50))
     const es = MockEventSource.instances[0]
-    es.readyState = 2 // CLOSED
+    // First two CLOSED events should trigger retries, not auth failure.
+    es.readyState = 2
+    es.onerror?.()
+    expect(handler).not.toHaveBeenCalled()
+    es.onerror?.()
+    expect(handler).not.toHaveBeenCalled()
+    // Third CLOSED event Should dispatch auth failure.
     es.onerror?.()
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ __auth: true }))
     mgr.close()

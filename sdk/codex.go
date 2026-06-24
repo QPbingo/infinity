@@ -67,31 +67,35 @@ func (c *CodexSDK) CreateSession(ctx context.Context, opts SessionOptions) (*Ses
 		CreatedAt: time.Now(),
 		Options:   opts,
 	}
-	c.sessionsMu.Lock(); c.sessions[id] = sess; c.sessionsMu.Unlock()
+	c.sessionsMu.Lock()
+	c.sessions[id] = sess
+	c.sessionsMu.Unlock()
 	return sess, nil
 }
 
 // SendPrompt sends a prompt by spawning `codex exec --json`.
 //
 // The subprocess is launched with:
-//   codex exec --json "<prompt>" [--model <m>] [--sandbox <mode>] ...
+//
+//	codex exec --json "<prompt>" [--model <m>] [--sandbox <mode>] ...
 //
 // Output lines are parsed as JSON and emitted as Message chunks.
 func (c *CodexSDK) SendPrompt(ctx context.Context, sessionID string, prompt string) (<-chan Message, error) {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.RLock()
+	sess, ok := c.sessions[sessionID]
+	c.sessionsMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("codex: session %s not found", sessionID)
 	}
 
 	ch := make(chan Message, 64)
-
 	go func() {
 		defer close(ch)
-			execID := generateExecID()
-
+		execID := generateExecID()
 
 		args := c.buildArgs(sess, prompt)
 		cmd := exec.CommandContext(ctx, c.binPath, args...)
+		defer cmd.Wait() // ensure process is reaped even on early return (cancellation)
 		if sess.Options.CWD != "" {
 			cmd.Dir = sess.Options.CWD
 		}
@@ -147,11 +151,11 @@ func (c *CodexSDK) SendPrompt(ctx context.Context, sessionID string, prompt stri
 		}
 
 		if err := cmd.Wait(); err != nil {
-				if ctx.Err() == nil {
-					ch <- Message{Type: MessageTypeError, Error: err.Error(), IsFinal: true, Timestamp: time.Now()}
-				}
+			if ctx.Err() == nil {
+				ch <- Message{Type: MessageTypeError, Error: err.Error(), IsFinal: true, Timestamp: time.Now()}
 			}
-		}()
+		}
+	}()
 
 	return ch, nil
 }
@@ -259,14 +263,18 @@ func (c *CodexSDK) parseMessage(raw map[string]interface{}, sessionID string) Me
 
 // ResumeSession returns metadata for an existing session.
 func (c *CodexSDK) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.Lock()
+	sess, ok := c.sessions[sessionID]
+	c.sessionsMu.Unlock()
 	if !ok {
 		sess = &Session{
 			ID:        sessionID,
 			AgentType: AgentCodex,
 			CreatedAt: time.Now(),
 		}
+		c.sessionsMu.Lock()
 		c.sessions[sessionID] = sess
+		c.sessionsMu.Unlock()
 	}
 	return sess, nil
 }
@@ -289,7 +297,9 @@ func (c *CodexSDK) CancelExecution(ctx context.Context, sessionID string) error 
 
 // RenameSession updates the session title in-memory.
 func (c *CodexSDK) RenameSession(ctx context.Context, sessionID string, title string) error {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.Lock()
+	defer c.sessionsMu.Unlock()
+	sess, ok := c.sessions[sessionID]
 	if !ok {
 		return fmt.Errorf("codex: session %s not found", sessionID)
 	}
@@ -308,8 +318,8 @@ func (c *CodexSDK) ListSessions(ctx context.Context, dir string) ([]SessionInfo,
 	output, err := cmd.Output()
 	if err != nil {
 		// Fall back to in-memory sessions
-	c.sessionsMu.RLock()
-	defer c.sessionsMu.RUnlock()
+		c.sessionsMu.RLock()
+		defer c.sessionsMu.RUnlock()
 		var list []SessionInfo
 		for _, s := range c.sessions {
 			if dir != "" && s.CWD != dir {
@@ -363,7 +373,9 @@ func (c *CodexSDK) ListSessions(ctx context.Context, dir string) ([]SessionInfo,
 
 // SetPermissionMode updates the permission mode for future turns.
 func (c *CodexSDK) SetPermissionMode(sessionID string, mode PermissionMode) error {
-	c.sessionsMu.RLock(); sess, ok := c.sessions[sessionID]; c.sessionsMu.RUnlock()
+	c.sessionsMu.RLock()
+	sess, ok := c.sessions[sessionID]
+	c.sessionsMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("codex: session %s not found", sessionID)
 	}

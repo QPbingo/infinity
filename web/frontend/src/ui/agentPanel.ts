@@ -105,6 +105,12 @@ export function renderExecHistory(): void {
   }
   output.classList.add('is-open')
   const current = agentStore.executions.find((e) => e.id === agentStore.currentExecId)
+  // Update the status indicator based on execution state.
+  const statusEl = document.getElementById('agent-status')
+  if (current && statusEl) {
+    const labels: Record<string, string> = { completed: 'Completed', error: 'Error', cancelled: 'Cancelled', running: 'Running…' }
+    statusEl.textContent = labels[current.status] || current.status
+  }
   if (current) {
     output.innerHTML = renderExecutionMessages(current)
     const back = output.querySelector('[data-action="exec-back"]')
