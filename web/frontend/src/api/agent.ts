@@ -3,6 +3,7 @@ import { request } from './client'
 export interface PromptResponse {
   exec_id: string
   session_id: string
+  session_key?: string
 }
 
 // sendPrompt POSTs to the agent prompt endpoint and returns exec_id
@@ -13,6 +14,7 @@ export async function sendPrompt(
   sessionId: string,
   prompt: string,
   timeoutMinutes = 10,
+  workspaceId?: number | null,
 ): Promise<PromptResponse> {
   return request<PromptResponse>(
     `/api/agent/${agentType}/sessions/${encodeURIComponent(sessionId)}/prompt`,
@@ -22,6 +24,7 @@ export async function sendPrompt(
         prompt,
         session_id: sessionId,
         timeout_minutes: timeoutMinutes,
+        workspace_id: workspaceId ?? undefined,
       }),
     },
   )

@@ -62,6 +62,7 @@ type Session struct {
 	LastHookEvent   string          `json:"last_hook_event"`
 	Turns           []Turn          `json:"turns"`
 	StoryID         *int64          `json:"story_id,omitempty"`
+	Source          string          `json:"source,omitempty"`
 	Payload         json.RawMessage `json:"payload,omitempty"`
 
 	ProcessCreateTimeMs int64 `json:"process_create_time_ms,omitempty"`

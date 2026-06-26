@@ -8,11 +8,7 @@ import (
 
 	"github.com/heybox/agent-monitor/internal/hierarchy"
 	"github.com/heybox/agent-monitor/internal/scanner"
-)
-
-const (
-	maxTurnsPerSession   = 500
-	maxAgentOutputLength = 100000
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 type NotifyFunc func(eventType string, data interface{})
@@ -45,6 +41,177 @@ func (sm *SessionManager) SetHierarchyStore(h *hierarchy.Store) { sm.hierStore =
 func (sm *SessionManager) SetHierarchyNotify(fn NotifyFunc)     { sm.hierNotify = fn }
 func (sm *SessionManager) UserID() string                       { return sm.userID }
 func (sm *SessionManager) DeviceID() string                     { return sm.deviceID }
+
+func (sm *SessionManager) RegisterSDKSession(agentType string, sdkSess *sdk.Session, workspaceID int64) (*Session, error) {
+	if sdkSess == nil {
+		return nil, nil
+	}
+	now := time.Now().UnixMilli()
+	createdAt := now
+	if !sdkSess.CreatedAt.IsZero() {
+		createdAt = sdkSess.CreatedAt.UnixMilli()
+	}
+	key := ComputeSessionKey(sm.userID, sm.deviceID, agentType, sdkSess.ID)
+
+	sm.mu.Lock()
+	sess, exists := sm.sessions[key]
+	if !exists {
+		sess = &Session{UserID: sm.userID, DeviceID: sm.deviceID, AgentType: agentType, AgentSessionID: sdkSess.ID, SessionKey: key, Status: StatusIdle, StartTimeMs: createdAt, Source: "sdk"}
+		sm.sessions[key] = sess
+	}
+	sess.Source = "sdk"
+	sess.AgentType = agentType
+	sess.AgentSessionID = sdkSess.ID
+	sess.CWD = sdkSess.CWD
+	if sdkSess.Title != "" {
+		sess.SessionTitle = sdkSess.Title
+	}
+	if sess.SessionTitle == "" {
+		sess.SessionTitle = sdkSess.ID
+	}
+	if sess.StartTimeMs == 0 {
+		sess.StartTimeMs = createdAt
+	}
+	sess.LastEventTimeMs = now
+	sess.LastEventType = "SDKSessionCreated"
+	sess.LastHookEvent = "SDKSessionCreated"
+	sess.lastHookTime = now
+	sm.mu.Unlock()
+
+	if sm.hierStore != nil {
+		story, err := sm.hierStore.FindOrCreateAgentSessionStory(workspaceID, agentType, key, sess.SessionTitle)
+		if err != nil {
+			return nil, err
+		}
+		sm.mu.Lock()
+		sess.StoryID = &story.ID
+		sm.mu.Unlock()
+	}
+
+	if sm.store != nil {
+		if err := sm.store.Upsert(sess); err != nil {
+			log.Printf("[session] upsert sdk session: %v", err)
+		}
+	}
+	if sm.hierNotify != nil && sm.hierStore != nil {
+		if tree, err := sm.hierStore.GetFullHierarchy(); err == nil {
+			sm.hierNotify("hierarchy_updated", tree)
+		}
+	}
+	if sm.notify != nil {
+		clone := *sess
+		clone.Payload = nil
+		if exists {
+			sm.notify("delta", &Delta{SessionKey: key, Changes: map[string]interface{}{"source": clone.Source, "session_title": clone.SessionTitle, "cwd": clone.CWD, "story_id": clone.StoryID}, TimestampMs: now})
+		} else {
+			sm.notify("session_added", &clone)
+		}
+	}
+	clone := *sess
+	return &clone, nil
+}
+
+func (sm *SessionManager) RecordSDKPrompt(key string, text string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessions[key]
+	if !ok || sess.Source != "sdk" {
+		return false
+	}
+	old := cloneSession(sess)
+	sess.TurnCount++
+	sess.UserInput = text
+	sess.Status = StatusActive
+	sess.LastEventTimeMs = time.Now().UnixMilli()
+	sess.LastEventType = "SDKPrompt"
+	sess.LastHookEvent = "SDKPrompt"
+	sess.lastHookTime = sess.LastEventTimeMs
+	sess.Turns = append(sess.Turns, Turn{TurnIdx: len(sess.Turns), UserInput: text, UserTS: sess.LastEventTimeMs, Entries: []TurnEntry{}})
+	if sm.store != nil {
+		if err := sm.store.Upsert(sess); err != nil {
+			log.Printf("[session] upsert sdk prompt: %v", err)
+		}
+	}
+	if sm.notify != nil {
+		if delta := sm.computeDelta(&old, sess); delta != nil {
+			sm.notify("delta", delta)
+		}
+	}
+	return true
+}
+
+func (sm *SessionManager) RecordSDKMessage(key string, msg sdk.Message) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessions[key]
+	if !ok || sess.Source != "sdk" {
+		return false
+	}
+	old := cloneSession(sess)
+	sess.LastEventTimeMs = time.Now().UnixMilli()
+	sess.LastEventType = "SDKMessage"
+	sess.LastHookEvent = "SDKMessage"
+	sess.lastHookTime = sess.LastEventTimeMs
+	if msg.Content != "" {
+		if sess.AgentOutput != "" {
+			sess.AgentOutput += "\n"
+		}
+		sess.AgentOutput += msg.Content
+	}
+	if len(sess.Turns) > 0 {
+		idx := len(sess.Turns) - 1
+		sess.Turns[idx].Entries = append(sess.Turns[idx].Entries, TurnEntry{Event: "SDKMessage", TS: sess.LastEventTimeMs, Payload: msg.RawJSON})
+	}
+	if sm.store != nil {
+		if err := sm.store.Upsert(sess); err != nil {
+			log.Printf("[session] upsert sdk message: %v", err)
+		}
+	}
+	if sm.notify != nil {
+		if delta := sm.computeDelta(&old, sess); delta != nil {
+			sm.notify("delta", delta)
+		}
+	}
+	return true
+}
+
+func (sm *SessionManager) MarkSDKSessionIdle(key string) {
+	sm.setSDKSessionStatus(key, StatusIdle, "SDKComplete", "")
+}
+func (sm *SessionManager) MarkSDKSessionStopped(key string) {
+	sm.setSDKSessionStatus(key, StatusStopped, "SDKCancelled", "")
+}
+func (sm *SessionManager) MarkSDKSessionError(key string, errText string) {
+	sm.setSDKSessionStatus(key, StatusError, "SDKError", errText)
+}
+
+func (sm *SessionManager) setSDKSessionStatus(key string, status Status, event string, output string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess, ok := sm.sessions[key]
+	if !ok || sess.Source != "sdk" {
+		return
+	}
+	old := cloneSession(sess)
+	sess.Status = status
+	sess.LastEventTimeMs = time.Now().UnixMilli()
+	sess.LastEventType = event
+	sess.LastHookEvent = event
+	sess.lastHookTime = sess.LastEventTimeMs
+	if output != "" {
+		sess.AgentOutput = output
+	}
+	if sm.store != nil {
+		if err := sm.store.Upsert(sess); err != nil {
+			log.Printf("[session] upsert sdk status: %v", err)
+		}
+	}
+	if sm.notify != nil {
+		if delta := sm.computeDelta(&old, sess); delta != nil {
+			sm.notify("delta", delta)
+		}
+	}
+}
 
 func (sm *SessionManager) LoadFromStore() {
 	sessions, err := sm.store.LoadAll()
@@ -138,7 +305,7 @@ func (sm *SessionManager) HandleEvent(event *HookEvent) {
 		return
 	}
 
-	old := *sess
+	old := cloneSession(sess)
 
 	// Update status from lifecycle events, then apply side effects.
 	if status, ok := handler.LifecycleStatus(event.Event); ok {
@@ -209,9 +376,11 @@ func (s *Session) buildTurnEntry(event *HookEvent, handler AgentHandler) {
 
 	case ClassPostTool:
 		s.completeTool(event, handler)
+		s.addEventEntry(event)
 
 	case ClassPostToolFailure:
 		s.failTool(event, handler)
+		s.addEventEntry(event)
 
 	default:
 		if s.webInputActive {
@@ -547,7 +716,7 @@ func (sm *SessionManager) HandleWebInput(key string, text string) bool {
 	if !ok {
 		return false
 	}
-	old := *sess
+	old := cloneSession(sess)
 	sess.TurnCount++
 	sess.UserInput = text
 	sess.LastEventTimeMs = time.Now().UnixMilli()
@@ -889,6 +1058,35 @@ func turnsEqual(a, b []Turn) bool {
 	return true
 }
 
+func cloneSession(s *Session) Session {
+	clone := *s
+	clone.Turns = cloneTurns(s.Turns)
+	return clone
+}
+
+func cloneTurns(turns []Turn) []Turn {
+	if turns == nil {
+		return nil
+	}
+	cloned := make([]Turn, len(turns))
+	for i, turn := range turns {
+		cloned[i] = turn
+		if turn.Entries != nil {
+			cloned[i].Entries = make([]TurnEntry, len(turn.Entries))
+			for j, entry := range turn.Entries {
+				cloned[i].Entries[j] = entry
+				if entry.Payload != nil {
+					cloned[i].Entries[j].Payload = append([]byte(nil), entry.Payload...)
+				}
+				if entry.Tools != nil {
+					cloned[i].Entries[j].Tools = append([]ToolCall(nil), entry.Tools...)
+				}
+			}
+		}
+	}
+	return cloned
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
@@ -904,14 +1102,6 @@ func abs(x float64) float64 {
 }
 
 func (s *Session) capGrowth() {
-	if len(s.Turns) > maxTurnsPerSession {
-		shift := len(s.Turns) - maxTurnsPerSession
-		s.Turns = s.Turns[shift:]
-		for i := range s.Turns {
-			s.Turns[i].TurnIdx = i
-		}
-	}
-	if len(s.AgentOutput) > maxAgentOutputLength {
-		s.AgentOutput = s.AgentOutput[len(s.AgentOutput)-maxAgentOutputLength:]
-	}
+	// Intentionally no-op: this monitor treats complete model output and raw
+	// event history as primary data, so pruning here would be data loss.
 }

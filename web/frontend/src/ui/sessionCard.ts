@@ -102,7 +102,6 @@ export function renderSessionDetail(): void {
       <div class="info-item"><div class="info-label">Turns</div><div class="info-value">${s.turn_count || 0}</div></div>
       <div class="info-item"><div class="info-label">CPU / Memory</div><div class="info-value">${s.cpu_percent ? s.cpu_percent.toFixed(0) + '%' : '—'} · ${s.memory_mb ? s.memory_mb.toFixed(0) + ' MB' : '—'}</div></div>
     </div>
-    ${s.agent_output ? renderOutputSection(String(s.agent_output)) : ''}
     ${hasTurns ? '<div class="detail-section-title">Timeline</div>' + renderTimeline(s.turns!, s.session_key) : ''}
     <div class="session-input-row">
       <input type="text" id="detail-input-${esc(s.session_key)}" placeholder="Send input to this session...">
@@ -129,11 +128,6 @@ function renderErrorAlert(s: Session): string {
     <div class="error-alert-title">${s.status === 'error' ? 'Error' : 'Process disconnected'}</div>
     <div class="error-alert-detail">${esc(s.agent_output || 'No additional details.')}</div>
   </div>`
-}
-
-function renderOutputSection(output: string): string {
-  return `<div class="detail-section-title">Output</div>
-    <div class="output-block">${esc(output)}</div>`
 }
 
 async function onSendDetail(key: string): Promise<void> {

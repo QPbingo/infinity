@@ -4,12 +4,22 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/heybox/agent-monitor/internal/auth"
+	"github.com/heybox/agent-monitor/internal/hierarchy"
+	"github.com/heybox/agent-monitor/sdk"
 )
 
 func makePayload(fields map[string]interface{}) json.RawMessage {
 	b, _ := json.Marshal(fields)
 	return b
+}
+
+func jsonContains(payload json.RawMessage, needle string) bool {
+	return strings.Contains(string(payload), needle)
 }
 
 func TestBuildTurn_UserPrompt(t *testing.T) {
@@ -104,6 +114,38 @@ func TestBuildTurn_ToolCallSingle(t *testing.T) {
 	}
 }
 
+func TestBuildTurn_PostToolPayloadPreservedAsOwnEntry(t *testing.T) {
+	s := &Session{}
+	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
+
+	s.applyEvent(&HookEvent{
+		Event: "PreToolUse", TimestampMs: 2000,
+		Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/foo.go"}}),
+	}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{
+		Event: "PostToolUse", TimestampMs: 3000,
+		Payload: makePayload(map[string]interface{}{
+			"tool_name":   "Read",
+			"tool_output": "file content",
+			"metadata":    map[string]interface{}{"bytes": 12},
+		}),
+	}, &ClaudeCodeHandler{})
+
+	if len(s.Turns[0].Entries) != 2 {
+		t.Fatalf("expected pre tool group plus post payload entry, got %d entries", len(s.Turns[0].Entries))
+	}
+	post := s.Turns[0].Entries[1]
+	if post.Event != "PostToolUse" {
+		t.Fatalf("post entry event=%s, want PostToolUse", post.Event)
+	}
+	if !json.Valid(post.Payload) || !json.Valid(s.Turns[0].Entries[0].Payload) {
+		t.Fatalf("expected valid raw payloads, got pre=%q post=%q", s.Turns[0].Entries[0].Payload, post.Payload)
+	}
+	if !jsonContains(post.Payload, `"metadata"`) {
+		t.Fatalf("post payload missing metadata: %s", post.Payload)
+	}
+}
+
 func TestBuildTurn_ToolCallMultipleSameGroup(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
@@ -121,18 +163,60 @@ func TestBuildTurn_ToolCallMultipleSameGroup(t *testing.T) {
 	}
 }
 
+func TestCapGrowthDoesNotDropSessionHistoryOrOutput(t *testing.T) {
+	s := &Session{}
+	for i := 0; i < 501; i++ {
+		s.Turns = append(s.Turns, Turn{TurnIdx: i, UserInput: "prompt"})
+	}
+	s.AgentOutput = string(make([]byte, 100001))
+
+	s.capGrowth()
+
+	if len(s.Turns) != 501 {
+		t.Fatalf("turns were trimmed to %d, want 501", len(s.Turns))
+	}
+	if len(s.AgentOutput) != 100001 {
+		t.Fatalf("agent output was trimmed to %d bytes, want 100001", len(s.AgentOutput))
+	}
+}
+
+func TestHandleEventToolCompletionDeltaIncludesTurns(t *testing.T) {
+	var deltas []*Delta
+	sm := NewSessionManager(nil, "u1", "d1")
+	sm.SetNotify(func(eventType string, data interface{}) {
+		if eventType == "delta" {
+			deltas = append(deltas, data.(*Delta))
+		}
+	})
+
+	sm.HandleEvent(&HookEvent{Event: "UserPromptSubmit", AgentType: "claude", SessionID: "sid1", TimestampMs: 1000, Payload: makePayload(map[string]interface{}{"prompt": "read"})})
+	sm.HandleEvent(&HookEvent{Event: "PreToolUse", AgentType: "claude", SessionID: "sid1", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_input": map[string]interface{}{"filePath": "/a.go"}})})
+	sm.HandleEvent(&HookEvent{Event: "PostToolUse", AgentType: "claude", SessionID: "sid1", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"tool_name": "Read", "tool_output": "content"})})
+
+	if len(deltas) == 0 {
+		t.Fatal("expected deltas")
+	}
+	last := deltas[len(deltas)-1]
+	if _, ok := last.Changes["turns"]; !ok {
+		t.Fatalf("last delta changes=%v, want turns", last.Changes)
+	}
+}
+
 func TestBuildTurn_ToolFailure(t *testing.T) {
 	s := &Session{}
 	s.Turns = append(s.Turns, Turn{TurnIdx: 0, UserInput: "test", UserTS: 1000, Entries: []TurnEntry{}})
 	s.applyEvent(&HookEvent{Event: "PreToolUse", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "tool_input": map[string]interface{}{"command": "rm -rf /"}})}, &ClaudeCodeHandler{})
 	s.applyEvent(&HookEvent{Event: "PostToolUseFailure", TimestampMs: 2500, Payload: makePayload(map[string]interface{}{"tool_name": "Bash", "reason": "blocked"})}, &ClaudeCodeHandler{})
 
-	if len(s.Turns[0].Entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(s.Turns[0].Entries))
+	if len(s.Turns[0].Entries) != 2 {
+		t.Fatalf("expected tool group plus failure payload entry, got %d", len(s.Turns[0].Entries))
 	}
 	tc := s.Turns[0].Entries[0].Tools[0]
 	if tc.Status != "error" || tc.Output != "blocked" {
 		t.Errorf("expected error tool, got status=%s output=%s", tc.Status, tc.Output)
+	}
+	if s.Turns[0].Entries[1].Event != "PostToolUseFailure" {
+		t.Fatalf("expected failure payload entry, got %s", s.Turns[0].Entries[1].Event)
 	}
 }
 
@@ -148,8 +232,8 @@ func TestBuildTurn_FullTurnFlow(t *testing.T) {
 		t.Fatalf("expected 1 turn, got %d", len(s.Turns))
 	}
 	turn := s.Turns[0]
-	if len(turn.Entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(turn.Entries))
+	if len(turn.Entries) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(turn.Entries))
 	}
 	if turn.Entries[0].Event != "ReasoningPart" {
 		t.Errorf("expected ReasoningPart, got %s", turn.Entries[0].Event)
@@ -157,8 +241,11 @@ func TestBuildTurn_FullTurnFlow(t *testing.T) {
 	if len(turn.Entries[1].Tools) != 1 {
 		t.Errorf("expected 1 tool in entry 1")
 	}
-	if turn.Entries[2].Event != "AssistantText" {
-		t.Errorf("expected AssistantText, got %s", turn.Entries[2].Event)
+	if turn.Entries[2].Event != "PostToolUse" {
+		t.Errorf("expected PostToolUse, got %s", turn.Entries[2].Event)
+	}
+	if turn.Entries[3].Event != "AssistantText" {
+		t.Errorf("expected AssistantText, got %s", turn.Entries[3].Event)
 	}
 }
 
@@ -228,6 +315,27 @@ func TestSessionEndAddsResult(t *testing.T) {
 	turn := s.Turns[0]
 	if len(turn.Entries) == 0 || turn.Entries[len(turn.Entries)-1].Event != "Stop" {
 		t.Errorf("expected Stop entry, got %d entries", len(turn.Entries))
+	}
+}
+
+func TestClaudeMessageDisplayDeltasAppendModelOutput(t *testing.T) {
+	s := &Session{AgentOutput: "[12:00:00] PostToolUse Bash -> tool output"}
+	s.applyEvent(&HookEvent{Event: "MessageDisplay", AgentType: "claude", TimestampMs: 2000, Payload: makePayload(map[string]interface{}{"index": 0, "delta": "final ", "final": false})}, &ClaudeCodeHandler{})
+	s.applyEvent(&HookEvent{Event: "MessageDisplay", AgentType: "claude", TimestampMs: 2100, Payload: makePayload(map[string]interface{}{"index": 1, "delta": "answer", "final": true})}, &ClaudeCodeHandler{})
+
+	want := "[12:00:00] PostToolUse Bash -> tool output\nfinal answer"
+	if s.AgentOutput != want {
+		t.Fatalf("AgentOutput=%q, want %q", s.AgentOutput, want)
+	}
+}
+
+func TestClaudeStopAddsLastAssistantMessageFallback(t *testing.T) {
+	s := &Session{AgentOutput: "[12:00:00] PostToolUse Bash -> tool output"}
+	s.applyEvent(&HookEvent{Event: "Stop", AgentType: "claude", TimestampMs: 3000, Payload: makePayload(map[string]interface{}{"last_assistant_message": "canonical final answer"})}, &ClaudeCodeHandler{})
+
+	want := "[12:00:00] PostToolUse Bash -> tool output\ncanonical final answer"
+	if s.AgentOutput != want {
+		t.Fatalf("AgentOutput=%q, want %q", s.AgentOutput, want)
 	}
 }
 
@@ -314,6 +422,111 @@ func TestStoreTurnsRoundTrip(t *testing.T) {
 	}
 	if loaded.Turns[0].Entries[2].Event != "AssistantText" {
 		t.Errorf("expected AssistantText, got %s", loaded.Turns[0].Entries[2].Event)
+	}
+}
+
+func newSDKSessionManagerFixture(t *testing.T) (*SessionManager, *Store, int64) {
+	t.Helper()
+	store, err := NewStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	db, err := store.DB()
+	if err != nil {
+		t.Fatalf("DB: %v", err)
+	}
+	authStore := auth.NewStore(db)
+	if err := authStore.EnsureTables(); err != nil {
+		t.Fatalf("auth tables: %v", err)
+	}
+	hierStore := hierarchy.NewStore(db)
+	if err := hierStore.EnsureTables(); err != nil {
+		t.Fatalf("hier tables: %v", err)
+	}
+	user, err := authStore.Register("sdk-user", "pw")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	ws, err := hierStore.CreateWorkspace("sdk-ws", "")
+	if err != nil {
+		t.Fatalf("create ws: %v", err)
+	}
+	hierStore.SetPermission(user.ID, "workspace", ws.ID, hierarchy.LevelWorkspaceAdmin, user.ID)
+	mgr := NewSessionManager(store, "local", "device-1")
+	mgr.SetHierarchyStore(hierStore)
+	return mgr, store, ws.ID
+}
+
+func TestRegisterSDKSessionCreatesMonitoredSession(t *testing.T) {
+	mgr, _, wsID := newSDKSessionManagerFixture(t)
+	sdkSess := &sdk.Session{ID: "sdk-sid", AgentType: sdk.AgentClaude, Title: "SDK title", CWD: "/tmp/sdk", CreatedAt: time.Now()}
+
+	monitored, err := mgr.RegisterSDKSession("claude", sdkSess, wsID)
+	if err != nil {
+		t.Fatalf("RegisterSDKSession: %v", err)
+	}
+
+	if monitored.Source != "sdk" {
+		t.Fatalf("Source=%q, want sdk", monitored.Source)
+	}
+	if monitored.AgentSessionID != "sdk-sid" || monitored.SessionTitle != "SDK title" || monitored.CWD != "/tmp/sdk" {
+		t.Fatalf("monitored session mismatch: %+v", monitored)
+	}
+	if monitored.StoryID == nil {
+		t.Fatalf("expected SDK session to be linked to a story")
+	}
+	if got := mgr.GetSession(monitored.SessionKey); got == nil {
+		t.Fatalf("registered session missing from manager")
+	}
+}
+
+func TestRecordSDKPromptDoesNotCreatePendingInput(t *testing.T) {
+	mgr, _, wsID := newSDKSessionManagerFixture(t)
+	monitored, err := mgr.RegisterSDKSession("claude", &sdk.Session{ID: "sdk-sid", AgentType: sdk.AgentClaude, CreatedAt: time.Now()}, wsID)
+	if err != nil {
+		t.Fatalf("RegisterSDKSession: %v", err)
+	}
+
+	if !mgr.RecordSDKPrompt(monitored.SessionKey, "hello sdk") {
+		t.Fatalf("RecordSDKPrompt returned false")
+	}
+
+	got := mgr.GetSession(monitored.SessionKey)
+	if got == nil || got.UserInput != "hello sdk" || got.Status != StatusActive || got.TurnCount != 1 || len(got.Turns) != 1 {
+		t.Fatalf("recorded SDK prompt session mismatch: %+v", got)
+	}
+	if pending := mgr.GetPendingInput(monitored.SessionKey); pending != "" {
+		t.Fatalf("pending input=%q, want empty for sdk session", pending)
+	}
+}
+
+func TestRecordSDKMessageEmitsLiveOutputDelta(t *testing.T) {
+	mgr, _, wsID := newSDKSessionManagerFixture(t)
+	monitored, err := mgr.RegisterSDKSession("claude", &sdk.Session{ID: "sdk-sid", AgentType: sdk.AgentClaude, CreatedAt: time.Now()}, wsID)
+	if err != nil {
+		t.Fatalf("RegisterSDKSession: %v", err)
+	}
+	mgr.RecordSDKPrompt(monitored.SessionKey, "hello sdk")
+	var gotDelta *Delta
+	mgr.SetNotify(func(eventType string, data interface{}) {
+		if eventType == "delta" {
+			gotDelta, _ = data.(*Delta)
+		}
+	})
+
+	if !mgr.RecordSDKMessage(monitored.SessionKey, sdk.Message{Type: sdk.MessageTypeText, Content: "stream chunk", Timestamp: time.Now()}) {
+		t.Fatalf("RecordSDKMessage returned false")
+	}
+
+	if gotDelta == nil {
+		t.Fatalf("expected delta")
+	}
+	if gotDelta.Changes["agent_output"] != "stream chunk" {
+		t.Fatalf("agent_output delta=%v, want stream chunk", gotDelta.Changes["agent_output"])
+	}
+	if _, ok := gotDelta.Changes["turns"]; !ok {
+		t.Fatalf("expected turns in delta changes: %#v", gotDelta.Changes)
 	}
 }
 

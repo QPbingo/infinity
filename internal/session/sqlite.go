@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS daemon_sessions (
 	turn_count       INTEGER DEFAULT 0,
 	turns            TEXT DEFAULT '[]',
 	git_branch       TEXT DEFAULT '',
+	source           TEXT DEFAULT 'hook',
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     ended_at         INTEGER,
@@ -93,6 +94,7 @@ var migrationSQLs = []string{
 	`ALTER TABLE daemon_sessions ADD COLUMN last_hook_event TEXT DEFAULT ''`,
 	`ALTER TABLE daemon_sessions ADD COLUMN turns TEXT DEFAULT '[]'`,
 	`ALTER TABLE daemon_sessions ADD COLUMN story_id INTEGER`,
+	`ALTER TABLE daemon_sessions ADD COLUMN source TEXT DEFAULT 'hook'`,
 }
 
 // Store wraps a SQLite database connection for session persistence.
@@ -201,9 +203,9 @@ func (s *Store) Upsert(sess *Session) error {
 			pid, terminal, cwd, status, start_time_ms,
 			last_event_time_ms, last_event_type, last_file, last_command,
 			user_input, agent_output, session_title, payload, last_hook_event,
-			memory_mb, cpu_percent, turn_count, turns, git_branch, story_id,
+			memory_mb, cpu_percent, turn_count, turns, git_branch, story_id, source,
 			created_at, updated_at, ended_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, device_id, agent_type, agent_session_id) DO UPDATE SET
 			session_key = excluded.session_key,
 			pid = excluded.pid,
@@ -226,6 +228,7 @@ func (s *Store) Upsert(sess *Session) error {
 			turns = excluded.turns,
 			git_branch = excluded.git_branch,
 			story_id = excluded.story_id,
+			source = excluded.source,
 			updated_at = excluded.updated_at,
 			ended_at = excluded.ended_at
 	`,
@@ -234,7 +237,7 @@ func (s *Store) Upsert(sess *Session) error {
 		sess.LastEventTimeMs, sess.LastEventType, sess.LastFile, sess.LastCommand,
 		sess.UserInput, sess.AgentOutput, sess.SessionTitle, payload, sess.LastHookEvent,
 		sess.MemoryMB, sess.CPUPercent, sess.TurnCount, turnsJSON, sess.GitBranch,
-		sess.StoryID,
+		sess.StoryID, sessionSource(sess),
 		now, now, endedAt,
 	)
 	return err
@@ -292,7 +295,7 @@ func (s *Store) LoadAll() ([]*Session, error) {
 			last_event_time_ms, last_event_type, last_file, last_command,
 			user_input, agent_output, session_title, payload, last_hook_event,
 			memory_mb, cpu_percent, turn_count, turns, git_branch,
-			story_id, created_at, updated_at
+			story_id, source, created_at, updated_at
 		FROM daemon_sessions
 		ORDER BY start_time_ms DESC
 	`)
@@ -312,7 +315,7 @@ func (s *Store) LoadAll() ([]*Session, error) {
 			&s.LastEventTimeMs, &s.LastEventType, &s.LastFile, &s.LastCommand,
 			&userInput, &agentOutput, &sessionTitle, &payload, &lastHookEvent,
 			&s.MemoryMB, &s.CPUPercent, &s.TurnCount, &turnsJSON, &s.GitBranch,
-			&storyID, new(int64), new(int64),
+			&storyID, &s.Source, new(int64), new(int64),
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
@@ -330,8 +333,18 @@ func (s *Store) LoadAll() ([]*Session, error) {
 			json.Unmarshal([]byte(turnsJSON), &s.Turns)
 		}
 		s.lastHookTime = s.LastEventTimeMs
+		if s.Source == "" {
+			s.Source = "hook"
+		}
 		sessions = append(sessions, &s)
 	}
 
 	return sessions, rows.Err()
+}
+
+func sessionSource(sess *Session) string {
+	if sess.Source == "" {
+		return "hook"
+	}
+	return sess.Source
 }

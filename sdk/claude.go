@@ -218,6 +218,9 @@ func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) M
 		SessionID: sessionID,
 		Timestamp: time.Now(),
 	}
+	if b, err := json.Marshal(raw); err == nil {
+		msg.RawJSON = b
+	}
 
 	msgType, _ := raw["type"].(string)
 	switch msgType {
@@ -225,11 +228,15 @@ func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) M
 		msg.Type = MessageTypeText
 		if msgBlock, ok := raw["message"].(map[string]interface{}); ok {
 			if content, ok := msgBlock["content"].([]interface{}); ok && len(content) > 0 {
-				if textBlock, ok := content[0].(map[string]interface{}); ok {
-					if text, ok := textBlock["text"].(string); ok {
-						msg.Content = text
+				var parts []string
+				for _, block := range content {
+					if textBlock, ok := block.(map[string]interface{}); ok {
+						if text, ok := textBlock["text"].(string); ok && text != "" {
+							parts = append(parts, text)
+						}
 					}
 				}
+				msg.Content = strings.Join(parts, "\n")
 			}
 		}
 	case "user":
@@ -240,8 +247,10 @@ func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) M
 		if result, ok := raw["result"].(string); ok {
 			msg.Content = result
 		}
-		if stopReason, ok := raw["stop_reason"].(string); ok {
-			msg.Content = stopReason
+		if msg.Content == "" {
+			if stopReason, ok := raw["stop_reason"].(string); ok {
+				msg.Content = stopReason
+			}
 		}
 	case "system":
 		msg.Type = MessageTypeSystem

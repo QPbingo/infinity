@@ -11,6 +11,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -18,21 +19,21 @@ import (
 type AgentType string
 
 const (
-	AgentClaude  AgentType = "claude"
+	AgentClaude   AgentType = "claude"
 	AgentOpenCode AgentType = "opencode"
-	AgentCodex   AgentType = "codex"
+	AgentCodex    AgentType = "codex"
 )
 
 // PermissionMode controls tool execution authorization.
 type PermissionMode string
 
 const (
-	PermissionDefault          PermissionMode = "default"
-	PermissionAcceptEdits      PermissionMode = "acceptEdits"
-	PermissionBypass           PermissionMode = "bypassPermissions"
-	PermissionPlan             PermissionMode = "plan"
-	PermissionReadOnly         PermissionMode = "readOnly"
-	PermissionAuto             PermissionMode = "auto"
+	PermissionDefault     PermissionMode = "default"
+	PermissionAcceptEdits PermissionMode = "acceptEdits"
+	PermissionBypass      PermissionMode = "bypassPermissions"
+	PermissionPlan        PermissionMode = "plan"
+	PermissionReadOnly    PermissionMode = "readOnly"
+	PermissionAuto        PermissionMode = "auto"
 )
 
 // SessionOptions configures a new session.
@@ -59,11 +60,11 @@ type SessionOptions struct {
 
 // Session represents an active agent session.
 type Session struct {
-	ID        string       `json:"id"`
-	AgentType AgentType    `json:"agent_type"`
-	Title     string       `json:"title"`
-	CWD       string       `json:"cwd"`
-	CreatedAt time.Time    `json:"created_at"`
+	ID        string         `json:"id"`
+	AgentType AgentType      `json:"agent_type"`
+	Title     string         `json:"title"`
+	CWD       string         `json:"cwd"`
+	CreatedAt time.Time      `json:"created_at"`
 	Options   SessionOptions `json:"-"`
 }
 
@@ -81,37 +82,37 @@ type SessionInfo struct {
 type MessageType string
 
 const (
-	MessageTypeText      MessageType = "text"
-	MessageTypeToolUse   MessageType = "tool_use"
+	MessageTypeText       MessageType = "text"
+	MessageTypeToolUse    MessageType = "tool_use"
 	MessageTypeToolResult MessageType = "tool_result"
-	MessageTypeError     MessageType = "error"
-	MessageTypeResult    MessageType = "result"
-	MessageTypeSystem    MessageType = "system"
-	MessageTypeThinking  MessageType = "thinking"
+	MessageTypeError      MessageType = "error"
+	MessageTypeResult     MessageType = "result"
+	MessageTypeSystem     MessageType = "system"
+	MessageTypeThinking   MessageType = "thinking"
 )
 
 // Message is a single chunk from the agent's output stream.
 type Message struct {
-	Type       MessageType `json:"type"`
-	SessionID  string      `json:"session_id,omitempty"`
-	Content    string      `json:"content,omitempty"`
-	ToolName   string      `json:"tool_name,omitempty"`
-	ToolInput  string      `json:"tool_input,omitempty"`
-	RawJSON    []byte      `json:"-"`
-	Timestamp  time.Time   `json:"timestamp"`
-	IsFinal    bool        `json:"is_final,omitempty"`
-	Error      string      `json:"error,omitempty"`
+	Type      MessageType     `json:"type"`
+	SessionID string          `json:"session_id,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolName  string          `json:"tool_name,omitempty"`
+	ToolInput string          `json:"tool_input,omitempty"`
+	RawJSON   json.RawMessage `json:"raw_json,omitempty"`
+	Timestamp time.Time       `json:"timestamp"`
+	IsFinal   bool            `json:"is_final,omitempty"`
+	Error     string          `json:"error,omitempty"`
 }
 
 // Result contains the final result of agent execution.
 type Result struct {
-	SessionID   string  `json:"session_id"`
-	Output      string  `json:"output"`
-	StopReason  string  `json:"stop_reason"`
-	NumTurns    int     `json:"num_turns"`
-	DurationMs  int64   `json:"duration_ms"`
-	CostUSD     float64 `json:"cost_usd,omitempty"`
-	IsError     bool    `json:"is_error"`
+	SessionID  string  `json:"session_id"`
+	Output     string  `json:"output"`
+	StopReason string  `json:"stop_reason"`
+	NumTurns   int     `json:"num_turns"`
+	DurationMs int64   `json:"duration_ms"`
+	CostUSD    float64 `json:"cost_usd,omitempty"`
+	IsError    bool    `json:"is_error"`
 }
 
 // AgentSDK is the unified interface for controlling an AI coding agent.

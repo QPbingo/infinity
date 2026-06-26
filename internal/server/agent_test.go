@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +12,64 @@ import (
 	"time"
 
 	"github.com/heybox/agent-monitor/internal/auth"
+	"github.com/heybox/agent-monitor/internal/hierarchy"
+	"github.com/heybox/agent-monitor/internal/session"
+	"github.com/heybox/agent-monitor/sdk"
 )
+
+type fakeAgentSDK struct {
+	created []*sdk.Session
+	prompts []string
+}
+
+func (f *fakeAgentSDK) AgentType() sdk.AgentType { return sdk.AgentClaude }
+func (f *fakeAgentSDK) CreateSession(ctx context.Context, opts sdk.SessionOptions) (*sdk.Session, error) {
+	s := &sdk.Session{ID: "sdk-session-1", AgentType: sdk.AgentClaude, Title: opts.Title, CWD: opts.CWD, CreatedAt: time.Now(), Options: opts}
+	f.created = append(f.created, s)
+	return s, nil
+}
+func (f *fakeAgentSDK) SendPrompt(ctx context.Context, sessionID string, prompt string) (<-chan sdk.Message, error) {
+	f.prompts = append(f.prompts, prompt)
+	ch := make(chan sdk.Message, 1)
+	ch <- sdk.Message{Type: sdk.MessageTypeText, SessionID: sessionID, Content: "ok", IsFinal: true, Timestamp: time.Now()}
+	close(ch)
+	return ch, nil
+}
+func (f *fakeAgentSDK) ResumeSession(ctx context.Context, sessionID string) (*sdk.Session, error) { return &sdk.Session{ID: sessionID, AgentType: sdk.AgentClaude, CreatedAt: time.Now()}, nil }
+func (f *fakeAgentSDK) CancelExecution(ctx context.Context, sessionID string) error { return nil }
+func (f *fakeAgentSDK) RenameSession(ctx context.Context, sessionID string, title string) error { return nil }
+func (f *fakeAgentSDK) ListSessions(ctx context.Context, dir string) ([]sdk.SessionInfo, error) { return nil, nil }
+func (f *fakeAgentSDK) SetPermissionMode(sessionID string, mode sdk.PermissionMode) error { return nil }
+func (f *fakeAgentSDK) Close() error { return nil }
+
+func newAgentManagerTestServer(t *testing.T) (*Server, string, *fakeAgentSDK, *session.SessionManager, int64) {
+	t.Helper()
+	store, err := session.NewStore(t.TempDir() + "/test.db")
+	if err != nil { t.Fatalf("session store: %v", err) }
+	t.Cleanup(func() { store.Close() })
+	db, err := store.DB()
+	if err != nil { t.Fatalf("db: %v", err) }
+	mgr := session.NewSessionManager(store, "local", "device-1")
+	authStore := auth.NewStore(db)
+	if err := authStore.EnsureTables(); err != nil { t.Fatalf("auth tables: %v", err) }
+	hierStore := hierarchy.NewStore(db)
+	if err := hierStore.EnsureTables(); err != nil { t.Fatalf("hier tables: %v", err) }
+	user, err := authStore.Register("sdk-owner", "pw")
+	if err != nil { t.Fatalf("register: %v", err) }
+	tok, err := authStore.CreateToken(user.ID)
+	if err != nil { t.Fatalf("token: %v", err) }
+	ws, err := hierStore.CreateWorkspace("sdk-ws", "")
+	if err != nil { t.Fatalf("workspace: %v", err) }
+	hierStore.SetPermission(user.ID, "workspace", ws.ID, hierarchy.LevelWorkspaceAdmin, user.ID)
+	mgr.SetHierarchyStore(hierStore)
+	agentMgr := sdk.NewAgentManager()
+	fake := &fakeAgentSDK{}
+	agentMgr.Register(sdk.AgentClaude, fake)
+	srv := New("127.0.0.1:0", mgr, "daemon-tok", authStore, hierStore, agentMgr, "http://localhost:5173")
+	srv.Start()
+	t.Cleanup(srv.Shutdown)
+	return srv, tok, fake, mgr, ws.ID
+}
 
 // TestAgentPrompt_ReturnsExecID covers AG-02 / constraint C: the REST response
 // contains exec_id + session_id. agentMgr is nil here, so we expect 503 — but
@@ -120,4 +178,55 @@ func TestSSE_ReceivesDeltaAfterInput(t *testing.T) {
 	// that the SSE stream stays open (no crash). This is sufficient for the
 	// REST→SSE wiring contract.
 	_ = br
+}
+
+func TestAgentCreateSessionRegistersMonitoredSession(t *testing.T) {
+	srv, tok, _, _, wsID := newAgentManagerTestServer(t)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/claude/sessions", strings.NewReader(`{"title":"SDK created","cwd":"/tmp/sdk","workspace_id":`+itoa(wsID)+`}`))
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: tok})
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatalf("post create: %v", err) }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated { t.Fatalf("create status=%d, want 201", resp.StatusCode) }
+	var body struct { SessionKey string `json:"session_key"` }
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.SessionKey == "" { t.Fatalf("expected session_key in create response") }
+
+	list := authedGet(ts.URL, "/api/sessions", tok)
+	if list.StatusCode != http.StatusOK { t.Fatalf("list status=%d", list.StatusCode) }
+	var sessions []struct { SessionKey string `json:"session_key"`; Source string `json:"source"`; AgentSessionID string `json:"agent_session_id"` }
+	json.NewDecoder(list.Body).Decode(&sessions)
+	list.Body.Close()
+	if len(sessions) != 1 || sessions[0].SessionKey != body.SessionKey || sessions[0].Source != "sdk" || sessions[0].AgentSessionID != "sdk-session-1" {
+		t.Fatalf("sessions=%+v, want registered sdk session", sessions)
+	}
+}
+
+func TestSessionInputRoutesSDKSessionToAgentManager(t *testing.T) {
+	srv, tok, fake, mgr, wsID := newAgentManagerTestServer(t)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/agent/claude/sessions", strings.NewReader(`{"workspace_id":`+itoa(wsID)+`}`))
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: tok})
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatalf("create: %v", err) }
+	var body struct { SessionKey string `json:"session_key"` }
+	json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+
+	resp = authedPost(ts.URL, "/api/sessions/"+body.SessionKey+"/input", `{"text":"hello from sessions"}`, tok)
+	if resp.StatusCode != http.StatusAccepted { t.Fatalf("input status=%d, want 202", resp.StatusCode) }
+	resp.Body.Close()
+	if len(fake.prompts) != 1 || fake.prompts[0] != "hello from sessions" {
+		t.Fatalf("fake prompts=%v", fake.prompts)
+	}
+	if pending := mgr.GetPendingInput(body.SessionKey); pending != "" {
+		t.Fatalf("pending input=%q, want empty for sdk session", pending)
+	}
 }

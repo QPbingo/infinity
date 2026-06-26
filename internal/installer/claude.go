@@ -36,6 +36,9 @@ func (c *ClaudeInstaller) Install(hookBinPath string) error {
 
 	dir := c.configDir()
 	settingsPath := filepath.Join(dir, "settings.json")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create claude config dir: %w", err)
+	}
 
 	if err := backupFile(settingsPath); err != nil {
 		return fmt.Errorf("backup settings.json: %w", err)
@@ -51,6 +54,7 @@ func (c *ClaudeInstaller) Install(hookBinPath string) error {
 		hooks = make(map[string]interface{})
 		settings["hooks"] = hooks
 	}
+	c.removeManagedHooks(hooks, hookBinPath)
 
 	events := []struct {
 		event   string
@@ -179,12 +183,8 @@ func (c *ClaudeInstaller) addHookEntry(hooks map[string]interface{}, event, matc
 
 	hookObj := map[string]interface{}{
 		"type":    "command",
-		"command": hookBinPath,
-		"args":    []string{"--agent-type", "claude"},
+		"command": hookBinPath + " --agent-type claude",
 		"name":    ManagedMarker,
-	}
-	if matcher != "" {
-		hookObj["matcher"] = matcher
 	}
 
 	newGroup := map[string]interface{}{

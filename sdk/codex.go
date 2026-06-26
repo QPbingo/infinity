@@ -197,6 +197,9 @@ func (c *CodexSDK) parseMessage(raw map[string]interface{}, sessionID string) Me
 		SessionID: sessionID,
 		Timestamp: time.Now(),
 	}
+	if b, err := json.Marshal(raw); err == nil {
+		msg.RawJSON = b
+	}
 
 	msgType, _ := raw["type"].(string)
 	switch msgType {

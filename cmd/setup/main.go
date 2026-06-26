@@ -120,9 +120,8 @@ func runInstall(args []string) {
 			fmt.Fprintf(os.Stderr, "  check status: %v\n", err)
 			continue
 		}
-		if installed && inst.Name() != "OpenCode" {
-			fmt.Printf("  already installed, skipping\n")
-			continue
+		if installed {
+			fmt.Printf("  already installed, refreshing\n")
 		}
 
 		if err := inst.Install(hookBinPath); err != nil {

@@ -70,16 +70,18 @@ describe('sessionsStore', () => {
     expect(merged[0].entries[0].event).toBe('PreToolUse')
   })
 
-  it('delta preserves draft inputs + evolves turns instead of replacing', () => {
+  it('delta preserves draft inputs and treats turns as server-authoritative', () => {
     sessionsStore.applyEvent({ type: 'snapshot', sessions: [mk('k1')] } as never)
     sessionsStore.setDraftInput('k1', 'typing')
     sessionsStore.applyEvent({ type: 'delta', session_key: 'k1', changes: { turn_count: 1, turns: [{ turn_idx: 0, user_input: 'hi', user_ts: 0, entries: [] }] } } as never)
     // delta should not wipe draft inputs.
     expect(sessionsStore.draftInputs['k1']).toBe('typing')
     expect(sessionsStore.sessions['k1'].turns).toHaveLength(1)
-    // a second delta with a new turn appends rather than replacing.
+    // a second delta replaces with the server-authoritative turns snapshot
+    // rather than keeping stale client-side fragments.
     sessionsStore.applyEvent({ type: 'delta', session_key: 'k1', changes: { turn_count: 2, turns: [{ turn_idx: 1, user_input: 'two', user_ts: 1, entries: [] }] } } as never)
-    expect(sessionsStore.sessions['k1'].turns).toHaveLength(2)
+    expect(sessionsStore.sessions['k1'].turns).toHaveLength(1)
+    expect(sessionsStore.sessions['k1'].turns?.[0].turn_idx).toBe(1)
   })
 
   it('statusCounts and agentTypeCounts compute live buckets', () => {

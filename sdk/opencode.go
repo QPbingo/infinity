@@ -217,11 +217,15 @@ func (o *OpenCodeSDK) CreateSession(ctx context.Context, opts SessionOptions) (*
 		return nil, fmt.Errorf("session/new: %w", err)
 	}
 
-	var result struct{ SessionID string `json:"sessionId"` }
+	var result struct {
+		SessionID string `json:"sessionId"`
+	}
 	json.Unmarshal(resp, &result)
 	if result.SessionID == "" {
 		var alt struct {
-			Result struct{ SessionID string `json:"sessionId"` }
+			Result struct {
+				SessionID string `json:"sessionId"`
+			}
 		}
 		json.Unmarshal(resp, &alt)
 		result.SessionID = alt.Result.SessionID
@@ -291,7 +295,7 @@ func (o *OpenCodeSDK) SendPrompt(ctx context.Context, sessionID string, prompt s
 }
 
 func (o *OpenCodeSDK) parseUpdate(params json.RawMessage, sessionID string) Message {
-	msg := Message{SessionID: sessionID, Timestamp: time.Now()}
+	msg := Message{SessionID: sessionID, Timestamp: time.Now(), RawJSON: append(json.RawMessage(nil), params...)}
 	var update map[string]interface{}
 	if err := json.Unmarshal(params, &update); err != nil {
 		msg.Type = MessageTypeSystem

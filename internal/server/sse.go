@@ -18,8 +18,8 @@ import (
 // ssePingPeriod to keep the connection alive and allow the client to detect
 // a dead connection within ~60s (client-side timeout).
 const (
-	ssePingPeriod   = 25 * time.Second
-	sseSendBufSize  = 256
+	ssePingPeriod  = 25 * time.Second
+	sseSendBufSize = 256
 )
 
 // SSEHub manages all SSE client connections and broadcasts server-pushed
@@ -86,9 +86,10 @@ func (h *SSEHub) Run() {
 				select {
 				case c.send <- msg:
 				default:
-					// Slow consumer: drop it to avoid unbounded memory.
-					close(c.send)
-					delete(h.clients, c)
+					// Complete output is more important than lossy real-time
+					// delivery. Apply backpressure instead of dropping a slow
+					// client and silently losing events.
+					c.send <- msg
 				}
 			}
 			h.mu.Unlock()

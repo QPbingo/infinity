@@ -451,20 +451,28 @@ func (s *Store) FindStoryBySessionKey(sessionKey string) (*Story, error) {
 }
 
 func (s *Store) FindOrCreateInspirationStory(agentType, sessionKey, sessionTitle string) (*Story, error) {
+	return s.FindOrCreateAgentSessionStory(1, agentType, sessionKey, sessionTitle)
+}
+
+func (s *Store) FindOrCreateAgentSessionStory(workspaceID int64, agentType, sessionKey, sessionTitle string) (*Story, error) {
 	existing, err := s.FindStoryBySessionKey(sessionKey)
 	if err == nil {
 		return existing, nil
 	}
+	if workspaceID == 0 {
+		workspaceID = 1
+	}
+	if _, err := s.EnsureWorkspaceInspiration(workspaceID); err != nil {
+		return nil, err
+	}
 
-	// Find the inspiration project within workspace 1 (the default Inspiration
-	// workspace), matching the agent type topic.
 	var projID, topicID int64
 	err = s.db.QueryRow(`
 		SELECT p.id, t.id FROM projects p
 		JOIN topics t ON t.project_id = p.id
-		WHERE p.workspace_id = 1 AND p.name = 'Agent Sessions' AND t.agent_type = ?
+		WHERE p.workspace_id = ? AND p.name = 'Agent Sessions' AND t.agent_type = ?
 		ORDER BY p.id ASC LIMIT 1
-	`, agentType).Scan(&projID, &topicID)
+	`, workspaceID, agentType).Scan(&projID, &topicID)
 	if err != nil {
 		return nil, fmt.Errorf("find inspiration topic for %s: %w", agentType, err)
 	}

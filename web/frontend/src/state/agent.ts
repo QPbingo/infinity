@@ -7,6 +7,8 @@ export interface AgentMessage {
   content?: string
   tool_name?: string
   tool_input?: string
+  raw_json?: unknown
+  error?: string
 }
 
 export interface Execution {
@@ -70,6 +72,8 @@ class AgentStore extends Store {
             content: event.content as string,
             tool_name: event.tool_name as string,
             tool_input: event.tool_input as string,
+            raw_json: event.raw_json,
+            error: event.error as string,
           })
           if (event.is_final) target.status = 'completed'
         }

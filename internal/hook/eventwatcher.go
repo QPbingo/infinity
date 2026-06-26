@@ -73,14 +73,14 @@ type EventHandler interface {
 //     processing.
 //   - No events are duplicated because position tracking is byte-accurate.
 type EventWatcher struct {
-	dir         string           // ~/.agent-monitor/ directory
-	filePath    string           // ~/.agent-monitor/events.jsonl
-	offsetPath  string           // ~/.agent-monitor/events.offset
-	tokenValue  string           // Daemon auth token for event validation
-	handler     EventHandler     // SessionManager (receives parsed events)
-	watcher     *fsnotify.Watcher // OS-level file change monitor
-	lastPos     int64             // Byte offset of last processed position
-	done        chan struct{}     // Close to signal the event loop to exit
+	dir        string            // ~/.agent-monitor/ directory
+	filePath   string            // ~/.agent-monitor/events.jsonl
+	offsetPath string            // ~/.agent-monitor/events.offset
+	tokenValue string            // Daemon auth token for event validation
+	handler    EventHandler      // SessionManager (receives parsed events)
+	watcher    *fsnotify.Watcher // OS-level file change monitor
+	lastPos    int64             // Byte offset of last processed position
+	done       chan struct{}     // Close to signal the event loop to exit
 }
 
 // NewEventWatcher creates a new event watcher for the given directory.
@@ -257,16 +257,20 @@ func (ew *EventWatcher) handleNewLines() {
 		return
 	}
 
-	// Use a scanner with a 2MB buffer to handle large payload objects
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+	reader := bufio.NewReader(f)
 
 	// Track byte position incrementally for accurate offset persistence
 	byteOffset := ew.lastPos
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Advance past this line + the trailing newline character
-		byteOffset += int64(len(scanner.Bytes()) + 1)
+	for {
+		lineBytes, readErr := reader.ReadBytes('\n')
+		if len(lineBytes) == 0 {
+			if readErr != nil && readErr != io.EOF {
+				log.Printf("[eventwatcher] read line: %v", readErr)
+			}
+			break
+		}
+		byteOffset += int64(len(lineBytes))
+		line := strings.TrimRight(string(lineBytes), "\r\n")
 
 		if line == "" {
 			continue
@@ -299,11 +303,10 @@ func (ew *EventWatcher) handleNewLines() {
 		// so it won't be re-read. If the crash happens before this, the line
 		// will be re-read (no data loss).
 		ew.saveOffset(byteOffset)
-	}
 
-	if scanner.Err() != nil {
-		log.Printf("[eventwatcher] scan error: %v", scanner.Err())
-		return
+		if readErr == io.EOF {
+			break
+		}
 	}
 
 	// Update the last known position after all lines are processed

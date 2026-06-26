@@ -18,6 +18,7 @@ export interface Session {
   pid?: number
   cwd?: string
   session_title?: string
+  source?: string
   last_event_time_ms: number
   turns?: Turn[]
   payload?: unknown
@@ -73,11 +74,9 @@ class SessionsStore extends Store {
     }
   }
 
-  // applyDelta merges a delta intelligently. The server may send a full
-  // `turns` array on every delta (cheap for it, expensive for us). Instead
-  // of overwriting, we diff turn-by-turn with the last turn_idx as the key
-  // and only copy the changed entries, so the UI doesn't drop and recreate
-  // the entire timeline when one new tool_use arrives.
+  // applyDelta treats the server's `turns` value as authoritative. Completeness
+  // beats local merge cleverness: if the server repairs, reorders, or restores
+  // raw entries, the browser must not keep stale client-side fragments.
   private applyDelta(event: SSEEvent): void {
     const key = event.session_key as string
     const changes = event.changes as Record<string, unknown>
@@ -88,7 +87,7 @@ class SessionsStore extends Store {
     for (const k of Object.keys(changes)) {
       if (k === 'turns') {
         const incoming = changes.turns as Turn[]
-        next.turns = mergeTurns(target.turns ?? [], incoming)
+        next.turns = incoming ? incoming.slice() : []
         continue
       }
       ;(next as Record<string, unknown>)[k] = changes[k]

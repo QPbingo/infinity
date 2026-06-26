@@ -36,6 +36,9 @@ func (c *CodexInstaller) Install(hookBinPath string) error {
 	}
 
 	dir := c.configDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create codex config dir: %w", err)
+	}
 
 	if err := c.enableHooksFeature(dir); err != nil {
 		return fmt.Errorf("enable hooks feature: %w", err)
@@ -51,6 +54,7 @@ func (c *CodexInstaller) Install(hookBinPath string) error {
 	if hooks == nil {
 		hooks = make(map[string]interface{})
 	}
+	c.removeManagedHooks(hooks, hookBinPath)
 
 	events := []struct {
 		event   string
@@ -130,6 +134,9 @@ func (c *CodexInstaller) Status() string {
 }
 
 func (c *CodexInstaller) configDir() string {
+	if d := os.Getenv("CODEX_HOME"); d != "" {
+		return d
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".codex")
 }
@@ -182,9 +189,6 @@ func (c *CodexInstaller) addHookEntry(hooks map[string]interface{}, event, match
 		"type":    "command",
 		"command": hookBinPath + " --agent-type codex",
 		"name":    ManagedMarker,
-	}
-	if matcher != "" {
-		hookObj["matcher"] = matcher
 	}
 
 	newGroup := map[string]interface{}{

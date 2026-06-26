@@ -1,6 +1,7 @@
 import { sendPrompt, cancelExecution } from '../api/agent'
 import { agentStore, type Execution } from '../state/agent'
-import { esc } from '../utils/format'
+import { hierarchyStore } from '../state/hierarchy'
+import { esc, formatPayloadDisplay } from '../utils/format'
 import { toast } from './toast'
 
 // renderAgentPanel mounts the agent control panel into #agent-panel (created
@@ -67,7 +68,7 @@ async function onSend(): Promise<void> {
   const status = document.getElementById('agent-status')
   if (status) status.textContent = 'Running…'
   try {
-    const res = await sendPrompt(agentType, sessionId, prompt, timeoutMin)
+    const res = await sendPrompt(agentType, sessionId, prompt, timeoutMin, hierarchyStore.selectedWorkspaceId)
     if (promptEl) promptEl.value = ''
     const sidInput = document.getElementById('agent-session-id') as HTMLInputElement | null
     if (sidInput && !sessionId) sidInput.value = res.session_id
@@ -139,6 +140,11 @@ function renderExecutionMessages(e: Execution): string {
       html += `<div class="msg-tool">[${esc(m.tool_name ?? 'tool')}] ${esc(m.tool_input ?? '')}</div>`
     } else if (m.content) {
       html += `<div class="msg-text">${esc(m.content)}</div>`
+    } else if (m.error) {
+      html += `<div class="msg-error">[ERROR] ${esc(m.error)}</div>`
+    }
+    if (m.raw_json) {
+      html += `<pre class="msg-raw">${esc(formatPayloadDisplay(m.raw_json, String(m.msg_type ?? m.type ?? 'message')))}</pre>`
     }
   }
   if (e.status === 'error' && e.error) {

@@ -548,6 +548,12 @@ func TestAUTH_SessionInputRequiresProjectAccess(t *testing.T) {
 	mgr.HandleEvent(&session.HookEvent{Event: "SessionStart", AgentType: "claude", SessionID: "s-auth", TimestampMs: time.Now().UnixMilli()})
 	key := session.ComputeSessionKey(mgr.UserID(), mgr.DeviceID(), "claude", "s-auth")
 
+	owner, err := http.Post(ts.URL+"/api/auth/register", "application/json", strings.NewReader(`{"username":"owner","password":"pw"}`))
+	if err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	owner.Body.Close()
+
 	// Register a second user with no permissions and verify they cannot send
 	// input to the session.
 	reg, err := http.Post(ts.URL+"/api/auth/register", "application/json", strings.NewReader(`{"username":"outsider","password":"pw"}`))
@@ -592,4 +598,63 @@ func TestAUTH_SSEInitialHierarchyIsScoped(t *testing.T) {
 		}
 	}
 	t.Fatalf("did not receive hierarchy_snapshot")
+}
+
+func TestAUTH_FirstRegisteredUserCanSeeResetAutoAssignedAgentSession(t *testing.T) {
+	store, err := session.NewStore(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("session store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	db, err := store.DB()
+	if err != nil {
+		t.Fatalf("db: %v", err)
+	}
+	mgr := session.NewSessionManager(store, "local", "device-1")
+	authStore := auth.NewStore(db)
+	if err := authStore.EnsureTables(); err != nil {
+		t.Fatalf("auth tables: %v", err)
+	}
+	hierStore := hierarchy.NewStore(db)
+	if err := hierStore.EnsureTables(); err != nil {
+		t.Fatalf("hier tables: %v", err)
+	}
+	if _, _, err := hierStore.EnsureInspiration(); err != nil {
+		t.Fatalf("ensure inspiration: %v", err)
+	}
+	mgr.SetHierarchyStore(hierStore)
+	srv := New("127.0.0.1:0", mgr, "daemon-tok", authStore, hierStore, nil, "http://localhost:5173")
+	srv.Start()
+	t.Cleanup(srv.Shutdown)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	t.Cleanup(ts.Close)
+	reg, err := http.Post(ts.URL+"/api/auth/register", "application/json", strings.NewReader(`{"username":"first","password":"pw"}`))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	var tok string
+	for _, c := range reg.Cookies() {
+		if c.Name == auth.SessionCookieName {
+			tok = c.Value
+		}
+	}
+	reg.Body.Close()
+	if tok == "" {
+		t.Fatalf("register did not set auth cookie")
+	}
+
+	srv.sseHub.sessions.HandleEvent(&session.HookEvent{Event: "SessionStart", AgentType: "claude", SessionID: "after-reset", TimestampMs: time.Now().UnixMilli()})
+
+	resp := authedGet(ts.URL, "/api/sessions", tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list sessions status=%d, want 200", resp.StatusCode)
+	}
+	var sessions []struct {
+		AgentSessionID string `json:"agent_session_id"`
+	}
+	json.NewDecoder(resp.Body).Decode(&sessions)
+	resp.Body.Close()
+	if len(sessions) != 1 || sessions[0].AgentSessionID != "after-reset" {
+		t.Fatalf("sessions=%+v, want auto-assigned reset session visible", sessions)
+	}
 }

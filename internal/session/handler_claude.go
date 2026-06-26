@@ -1,6 +1,9 @@
 package session
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type ClaudeCodeHandler struct{}
 
@@ -95,7 +98,47 @@ func (h *ClaudeCodeHandler) OnEvent(sess *Session, event *HookEvent) {
 		sess.appendAgentOutput(event.Payload)
 	case "AssistantText", "ReasoningPart":
 		sess.extractModelOutput(event.Payload)
+	case "MessageDisplay":
+		sess.appendClaudeMessageDisplay(event.Payload)
+	case "Stop":
+		sess.appendClaudeFinalMessage(event.Payload)
 	case "VcsBranchUpdated":
 		sess.extractBranchInfo(event.Payload)
 	}
+}
+
+func (s *Session) appendClaudeMessageDisplay(payload json.RawMessage) {
+	if len(payload) == 0 {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	delta, _ := data["delta"].(string)
+	if delta == "" {
+		return
+	}
+	if idx, ok := data["index"].(float64); ok && idx == 0 && s.AgentOutput != "" && !strings.HasSuffix(s.AgentOutput, "\n") {
+		s.AgentOutput += "\n"
+	}
+	s.AgentOutput += delta
+}
+
+func (s *Session) appendClaudeFinalMessage(payload json.RawMessage) {
+	if len(payload) == 0 {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	final, _ := data["last_assistant_message"].(string)
+	if final == "" || strings.Contains(s.AgentOutput, final) {
+		return
+	}
+	if s.AgentOutput != "" && !strings.HasSuffix(s.AgentOutput, "\n") {
+		s.AgentOutput += "\n"
+	}
+	s.AgentOutput += final
 }

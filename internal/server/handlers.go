@@ -213,10 +213,20 @@ func (h *Handlers) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username and password required"})
 		return
 	}
+	userCountBefore := 0
+	if h.authStore != nil {
+		if n, err := h.authStore.UserCount(); err == nil {
+			userCountBefore = n
+		}
+	}
 	u, err := h.authStore.Register(req.Username, req.Password)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
+	}
+	if userCountBefore == 0 && h.hierStore != nil {
+		h.hierStore.EnsureInspiration()
+		h.hierStore.SetPermission(u.ID, "workspace", 1, hierarchy.LevelWorkspaceAdmin, u.ID)
 	}
 	tok, _ := h.authStore.CreateToken(u.ID)
 	auth.SetSessionCookie(w, tok, isCrossOrigin(r))
@@ -303,11 +313,15 @@ func (h *Handlers) handleCreateWorkspace(w http.ResponseWriter, r *http.Request)
 	if u := auth.GetUser(r); u != nil {
 		h.hierStore.SetPermission(u.ID, "workspace", ws.ID, hierarchy.LevelWorkspaceAdmin, u.ID)
 	}
-	writeJSON(w, http.StatusCreated, ws); h.broadcastHierarchy()
+	writeJSON(w, http.StatusCreated, ws)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateWorkspace(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, id) {
 		return
 	}
@@ -317,26 +331,37 @@ func (h *Handlers) handleUpdateWorkspace(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.hierStore.UpdateWorkspace(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, id) {
 		return
 	}
 	h.hierStore.DeleteWorkspace(id)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	wid, ok := parsePathID(w, r, "wid"); if !ok { return }
+	wid, ok := parsePathID(w, r, "wid")
+	if !ok {
+		return
+	}
 	projects, _ := h.hierStore.ListProjects(wid)
 	writeJSON(w, http.StatusOK, projects)
 }
 
 func (h *Handlers) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	wid, ok := parsePathID(w, r, "wid"); if !ok { return }
+	wid, ok := parsePathID(w, r, "wid")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, wid) {
 		return
 	}
@@ -357,11 +382,15 @@ func (h *Handlers) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if u := auth.GetUser(r); u != nil {
 		h.hierStore.SetPermission(u.ID, "project", proj.ID, hierarchy.LevelProjectAdmin, u.ID)
 	}
-	writeJSON(w, http.StatusCreated, proj); h.broadcastHierarchy()
+	writeJSON(w, http.StatusCreated, proj)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, id) {
 		return
 	}
@@ -371,26 +400,37 @@ func (h *Handlers) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.hierStore.UpdateProject(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, h.projWS(id)) {
 		return
 	}
 	h.hierStore.DeleteProject(id)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListTopics(w http.ResponseWriter, r *http.Request) {
-	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
+	pid, ok := parsePathID(w, r, "pid")
+	if !ok {
+		return
+	}
 	topics, _ := h.hierStore.ListTopics(pid)
 	writeJSON(w, http.StatusOK, topics)
 }
 
 func (h *Handlers) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
-	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
+	pid, ok := parsePathID(w, r, "pid")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, pid) {
 		return
 	}
@@ -411,11 +451,15 @@ func (h *Handlers) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, topic); h.broadcastHierarchy()
+	writeJSON(w, http.StatusCreated, topic)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateTopic(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, h.topProj(id)) {
 		return
 	}
@@ -425,27 +469,41 @@ func (h *Handlers) handleUpdateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.hierStore.UpdateTopic(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, h.topProj(id)) {
 		return
 	}
 	h.hierStore.DeleteTopic(id)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleListStories(w http.ResponseWriter, r *http.Request) {
-	tid, ok := parsePathID(w, r, "tid"); if !ok { return }
+	tid, ok := parsePathID(w, r, "tid")
+	if !ok {
+		return
+	}
 	stories, _ := h.hierStore.ListStories(tid)
 	writeJSON(w, http.StatusOK, stories)
 }
 
 func (h *Handlers) handleCreateStory(w http.ResponseWriter, r *http.Request) {
-	pid, ok := parsePathID(w, r, "pid"); if !ok { return }
-	tid, ok := parsePathID(w, r, "tid"); if !ok { return }
+	pid, ok := parsePathID(w, r, "pid")
+	if !ok {
+		return
+	}
+	tid, ok := parsePathID(w, r, "tid")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, pid) {
 		return
 	}
@@ -469,11 +527,15 @@ func (h *Handlers) handleCreateStory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, story); h.broadcastHierarchy()
+	writeJSON(w, http.StatusCreated, story)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleUpdateStory(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) {
 		return
 	}
@@ -483,22 +545,30 @@ func (h *Handlers) handleUpdateStory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.hierStore.UpdateStory(id, req.Name, req.Description)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 func (h *Handlers) handleDeleteStory(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, h.topProj(h.stoTop(id))) {
 		return
 	}
 	h.hierStore.DeleteStory(id)
-	w.WriteHeader(http.StatusNoContent); h.broadcastHierarchy()
+	w.WriteHeader(http.StatusNoContent)
+	h.broadcastHierarchy()
 }
 
 // ── Permissions ──
 
 func (h *Handlers) handleListWorkspacePerms(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, id) {
 		return
 	}
@@ -507,7 +577,10 @@ func (h *Handlers) handleListWorkspacePerms(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handlers) handleSetWorkspacePerm(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, id) {
 		return
 	}
@@ -528,8 +601,14 @@ func (h *Handlers) handleSetWorkspacePerm(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handlers) handleRemoveWorkspacePerm(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
-	uid, ok := parsePathID(w, r, "uid"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
+	uid, ok := parsePathID(w, r, "uid")
+	if !ok {
+		return
+	}
 	if !h.checkWSAdmin(w, r, id) {
 		return
 	}
@@ -538,7 +617,10 @@ func (h *Handlers) handleRemoveWorkspacePerm(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *Handlers) handleListProjectPerms(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, id) {
 		return
 	}
@@ -547,7 +629,10 @@ func (h *Handlers) handleListProjectPerms(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handlers) handleSetProjectPerm(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, id) {
 		return
 	}
@@ -568,8 +653,14 @@ func (h *Handlers) handleSetProjectPerm(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handlers) handleRemoveProjectPerm(w http.ResponseWriter, r *http.Request) {
-	id, ok := parsePathID(w, r, "id"); if !ok { return }
-	uid, ok := parsePathID(w, r, "uid"); if !ok { return }
+	id, ok := parsePathID(w, r, "id")
+	if !ok {
+		return
+	}
+	uid, ok := parsePathID(w, r, "uid")
+	if !ok {
+		return
+	}
 	if !h.checkProjAdmin(w, r, id) {
 		return
 	}
@@ -660,6 +751,19 @@ func (h *Handlers) handleSendInput(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session access denied"})
 		return
 	}
+	if sess.Source == "sdk" {
+		if h.agentMgr == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
+			return
+		}
+		execID, err := h.startAgentExecution(sdk.AgentType(sess.AgentType), sess.AgentSessionID, sess.SessionKey, req.Text, 10)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"exec_id": execID, "session_id": sess.AgentSessionID, "session_key": sess.SessionKey})
+		return
+	}
 	if !h.sessions.HandleWebInput(key, req.Text) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 		return
@@ -705,6 +809,68 @@ func (h *Handlers) agentType(r *http.Request) sdk.AgentType {
 	return sdk.AgentType(r.PathValue("type"))
 }
 
+func (h *Handlers) resolveWorkspaceForSDK(w http.ResponseWriter, r *http.Request, workspaceID int64) (int64, bool) {
+	if h.hierStore == nil {
+		return workspaceID, true
+	}
+	u := h.curUser(w, r)
+	if u == nil {
+		return 0, false
+	}
+	if workspaceID == 0 {
+		ids, _ := h.hierStore.GetAuthorizedWorkspaceIDs(u.ID)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workspace_id required"})
+			return 0, false
+		}
+		workspaceID = ids[0]
+	}
+	ok, _ := h.hierStore.CheckWorkspacePermission(u.ID, workspaceID, hierarchy.LevelWorkspaceViewer)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace access required"})
+		return 0, false
+	}
+	return workspaceID, true
+}
+
+func (h *Handlers) monitoredSessionKey(agentType sdk.AgentType, sessionID string) string {
+	return session.ComputeSessionKey(h.sessions.UserID(), h.sessions.DeviceID(), string(agentType), sessionID)
+}
+
+func (h *Handlers) startAgentExecution(agentType sdk.AgentType, sessionID string, sessionKey string, prompt string, timeoutMin int) (string, error) {
+	execID := generateExecID()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+	h.agentMgr.Executions.Create(execID, sessionID, agentType, prompt, cancel)
+	h.sessions.RecordSDKPrompt(sessionKey, prompt)
+	h.sseHub.BroadcastAgent(map[string]interface{}{"type": "agent_exec_started", "exec_id": execID, "agent_type": string(agentType), "session_id": sessionID, "prompt": prompt})
+
+	go func() {
+		defer cancel()
+		ch, err := h.agentMgr.SendPrompt(ctx, agentType, sessionID, prompt)
+		if err != nil {
+			h.agentMgr.Executions.Fail(execID, err.Error())
+			h.sessions.MarkSDKSessionError(sessionKey, err.Error())
+			h.sseHub.BroadcastAgent(map[string]interface{}{"type": "agent_error", "exec_id": execID, "error": err.Error()})
+			return
+		}
+		for msg := range ch {
+			h.agentMgr.Executions.AppendMessage(execID, msg)
+			h.sessions.RecordSDKMessage(sessionKey, msg)
+			h.sseHub.BroadcastAgent(map[string]interface{}{"type": "agent_message", "exec_id": execID, "agent_type": string(agentType), "session_id": sessionID, "msg_type": string(msg.Type), "content": msg.Content, "tool_name": msg.ToolName, "tool_input": msg.ToolInput, "raw_json": msg.RawJSON, "is_final": msg.IsFinal, "error": msg.Error})
+			if msg.Type == sdk.MessageTypeError && msg.IsFinal {
+				h.agentMgr.Executions.Fail(execID, msg.Error)
+				h.sessions.MarkSDKSessionError(sessionKey, msg.Error)
+				return
+			}
+		}
+		if exec := h.agentMgr.Executions.Get(execID); exec == nil || exec.Status != sdk.ExecutionCancelled {
+			h.agentMgr.Executions.Complete(execID)
+			h.sessions.MarkSDKSessionIdle(sessionKey)
+		}
+	}()
+	return execID, nil
+}
+
 func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Request) {
 	if h.agentMgr == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent manager not configured"})
@@ -717,12 +883,18 @@ func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Reque
 		AllowedTools   []string `json:"allowed_tools"`
 		MaxTurns       int      `json:"max_turns"`
 		Title          string   `json:"title"`
+		WorkspaceID    int64    `json:"workspace_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	sess, err := h.agentMgr.CreateSession(r.Context(), h.agentType(r), sdk.SessionOptions{
+	workspaceID, ok := h.resolveWorkspaceForSDK(w, r, req.WorkspaceID)
+	if !ok {
+		return
+	}
+	agentType := h.agentType(r)
+	sess, err := h.agentMgr.CreateSession(r.Context(), agentType, sdk.SessionOptions{
 		CWD: req.CWD, Model: req.Model, PermissionMode: sdk.PermissionMode(req.PermissionMode),
 		AllowedTools: req.AllowedTools, MaxTurns: req.MaxTurns, Title: req.Title,
 	})
@@ -730,7 +902,12 @@ func (h *Handlers) handleAgentCreateSession(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, sess)
+	monitored, err := h.sessions.RegisterSDKSession(string(agentType), sess, workspaceID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"id": sess.ID, "agent_type": sess.AgentType, "title": sess.Title, "cwd": sess.CWD, "created_at": sess.CreatedAt, "session_key": monitored.SessionKey})
 }
 
 func (h *Handlers) handleAgentListSessions(w http.ResponseWriter, r *http.Request) {
@@ -766,6 +943,7 @@ func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request)
 		Prompt         string `json:"prompt"`
 		SessionID      string `json:"session_id"`
 		TimeoutMinutes int    `json:"timeout_minutes"`
+		WorkspaceID    int64  `json:"workspace_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -788,69 +966,56 @@ func (h *Handlers) handleAgentSendPrompt(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	execID := generateExecID()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMin)*time.Minute)
+	workspaceID, ok := h.resolveWorkspaceForSDK(w, r, req.WorkspaceID)
+	if !ok {
+		return
+	}
 
 	// Auto-create a session if none was provided (AG-01).
+	var sessionKey string
 	if sessionID == "" {
-		sess, err := h.agentMgr.CreateSession(ctx, agentType, sdk.SessionOptions{Title: truncatePrompt(req.Prompt, 60)})
+		sess, err := h.agentMgr.CreateSession(r.Context(), agentType, sdk.SessionOptions{Title: truncatePrompt(req.Prompt, 60)})
 		if err != nil {
-			cancel()
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		sessionID = sess.ID
+		monitored, err := h.sessions.RegisterSDKSession(string(agentType), sess, workspaceID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		sessionKey = monitored.SessionKey
 		// Inform all clients (including the initiator) of the new session id.
 		h.sseHub.BroadcastAgent(map[string]interface{}{
 			"type": "agent_session_created", "agent_type": string(agentType),
-			"session_id": sessionID, "exec_id": execID,
+			"session_id": sessionID, "session_key": sessionKey,
 		})
+	} else {
+		sessionKey = h.monitoredSessionKey(agentType, sessionID)
+		if h.sessions.GetSession(sessionKey) == nil {
+			monitored, err := h.sessions.RegisterSDKSession(string(agentType), &sdk.Session{ID: sessionID, AgentType: agentType, CreatedAt: time.Now()}, workspaceID)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			sessionKey = monitored.SessionKey
+		}
 	}
 
-	// Register in the execution store so reconnecting clients see it (AG-06).
-	h.agentMgr.Executions.Create(execID, sessionID, agentType, req.Prompt, cancel)
-
-	// Broadcast exec_started to every dashboard (AG-02/AG-10).
-	h.sseHub.BroadcastAgent(map[string]interface{}{
-		"type": "agent_exec_started", "exec_id": execID,
-		"agent_type": string(agentType), "session_id": sessionID, "prompt": req.Prompt,
-	})
+	execID, err := h.startAgentExecution(agentType, sessionID, sessionKey, req.Prompt, timeoutMin)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// Respond immediately with exec_id (constraint C). The execution continues
 	// in the background; messages flow over the global SSE stream.
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
-		"exec_id":    execID,
-		"session_id": sessionID,
+		"exec_id":     execID,
+		"session_id":  sessionID,
+		"session_key": sessionKey,
 	})
-
-	// Launch the execution. Detached from the HTTP request so it survives the
-	// client closing the tab (AG-05).
-	go func() {
-		defer cancel()
-		ch, err := h.agentMgr.SendPrompt(ctx, agentType, sessionID, req.Prompt)
-		if err != nil {
-			h.agentMgr.Executions.Fail(execID, err.Error())
-			h.sseHub.BroadcastAgent(map[string]interface{}{
-				"type": "agent_error", "exec_id": execID, "error": err.Error(),
-			})
-			return
-		}
-		for msg := range ch {
-			h.agentMgr.Executions.AppendMessage(execID, msg)
-			h.sseHub.BroadcastAgent(map[string]interface{}{
-				"type": "agent_message", "exec_id": execID,
-				"agent_type": string(agentType), "session_id": sessionID,
-				"msg_type": string(msg.Type), "content": msg.Content,
-				"tool_name": msg.ToolName, "tool_input": msg.ToolInput,
-				"is_final": msg.IsFinal, "error": msg.Error,
-			})
-			if msg.Type == sdk.MessageTypeError && msg.IsFinal {
-				h.agentMgr.Executions.Fail(execID, msg.Error)
-				return
-			}
-		}
-		h.agentMgr.Executions.Complete(execID)
-	}()
 }
 
 // handleAgentCancel cancels a running execution and broadcasts agent_cancelled
@@ -874,6 +1039,8 @@ func (h *Handlers) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	sessionKey := h.monitoredSessionKey(agentType, sessionID)
+	h.sessions.MarkSDKSessionStopped(sessionKey)
 	h.sseHub.BroadcastAgent(map[string]interface{}{
 		"type": "agent_cancelled", "exec_id": execID, "session_id": sessionID,
 	})
