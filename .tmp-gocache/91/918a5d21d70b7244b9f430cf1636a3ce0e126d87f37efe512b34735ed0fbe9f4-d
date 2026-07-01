@@ -1,0 +1,10 @@
+# test log
+getenv GOTMPDIR
+getenv TMPDIR
+stat /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001/events.jsonl
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001/events.jsonl
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001/events.jsonl
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001/events.offset
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T/TestEventWatcherProcessesLargeSingleLineEvent1968165294/001/events.offset
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T

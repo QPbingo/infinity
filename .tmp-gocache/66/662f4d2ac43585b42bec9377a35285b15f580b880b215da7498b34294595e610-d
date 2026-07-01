@@ -1,0 +1,13 @@
+# test log
+getenv GOTMPDIR
+getenv TMPDIR
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T
+getenv GOTMPDIR
+getenv TMPDIR
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T
+getenv GOTMPDIR
+getenv TMPDIR
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T
+getenv GOTMPDIR
+getenv TMPDIR
+open /var/folders/zz/x9yvm9fs0wjbmxrh_2hw470w0000gn/T

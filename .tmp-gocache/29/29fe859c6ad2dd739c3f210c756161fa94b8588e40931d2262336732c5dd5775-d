@@ -1,0 +1,6 @@
+./claude.go
+./codex.go
+./execution.go
+./manager.go
+./opencode.go
+./sdk.go

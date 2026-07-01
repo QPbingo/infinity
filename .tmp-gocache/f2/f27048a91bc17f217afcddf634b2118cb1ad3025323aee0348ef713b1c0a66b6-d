@@ -1,0 +1,3 @@
+./scanner.go
+./terminal.go
+./types.go

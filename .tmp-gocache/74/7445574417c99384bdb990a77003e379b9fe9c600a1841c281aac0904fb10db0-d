@@ -1,0 +1,6 @@
+./claude.go
+./codex.go
+./installer.go
+./opencode.go
+./claude_test.go
+./codex_test.go

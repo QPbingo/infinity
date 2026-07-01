@@ -1,0 +1,11 @@
+./cors.go
+./handlers.go
+./scope.go
+./server.go
+./sse.go
+./agent_test.go
+./cors_test.go
+./coverage_test.go
+./hierarchy_test.go
+./server_test.go
+./sse_test.go
